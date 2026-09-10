@@ -17,6 +17,76 @@ OUT = Path("output")
 OUT.mkdir(exist_ok=True)
 
 
+def save_page(driver, prefix):
+    OUT.joinpath(prefix + ".html").write_text(
+        driver.page_source,
+        encoding="utf-8"
+    )
+
+    body_text = driver.find_element(By.TAG_NAME, "body").text
+
+    OUT.joinpath(prefix + ".txt").write_text(
+        body_text,
+        encoding="utf-8"
+    )
+
+    try:
+        driver.save_screenshot(
+            str(OUT / (prefix + ".png"))
+        )
+    except Exception as e:
+        print("SCREENSHOT ERROR:", e)
+
+    return body_text
+
+
+def print_page_elements(driver):
+    print("")
+    print("=== INPUTS FOUND ===")
+
+    inputs = driver.find_elements(By.TAG_NAME, "input")
+
+    for n, item in enumerate(inputs, 1):
+        print(
+            "INPUT", n,
+            "type=", repr(item.get_attribute("type")),
+            "placeholder=", repr(item.get_attribute("placeholder")),
+            "name=", repr(item.get_attribute("name")),
+            "id=", repr(item.get_attribute("id")),
+            "aria-label=", repr(item.get_attribute("aria-label"))
+        )
+
+    print("")
+    print("=== TEXTAREAS FOUND ===")
+
+    textareas = driver.find_elements(By.TAG_NAME, "textarea")
+
+    for n, item in enumerate(textareas, 1):
+        print(
+            "TEXTAREA", n,
+            "placeholder=", repr(item.get_attribute("placeholder")),
+            "name=", repr(item.get_attribute("name")),
+            "id=", repr(item.get_attribute("id")),
+            "aria-label=", repr(item.get_attribute("aria-label"))
+        )
+
+    print("")
+    print("=== BUTTONS FOUND ===")
+
+    buttons = driver.find_elements(By.TAG_NAME, "button")
+
+    for n, button in enumerate(buttons, 1):
+        print(
+            "BUTTON", n,
+            "text=", repr(button.text),
+            "type=", repr(button.get_attribute("type")),
+            "title=", repr(button.get_attribute("title")),
+            "aria-label=", repr(button.get_attribute("aria-label"))
+        )
+
+    return inputs
+
+
 def main():
     print("=" * 60)
     print("SAMRUK KAZYNA - GITHUB HEADLESS TEST")
@@ -33,22 +103,36 @@ def main():
 
     try:
         print("OPEN:", URL)
+
         driver.get(URL)
 
         wait = WebDriverWait(driver, 40)
+
         wait.until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
+            EC.presence_of_element_located(
+                (By.TAG_NAME, "body")
+            )
         )
+
+        time.sleep(6)
 
         print("TITLE:", driver.title)
         print("URL:", driver.current_url)
 
-        inputs = driver.find_elements(By.TAG_NAME, "input")
+        body_text = save_page(
+            driver,
+            "samruk_before_search"
+        )
+
+        inputs = print_page_elements(driver)
 
         search_box = None
 
         for item in inputs:
-            placeholder = item.get_attribute("placeholder") or ""
+            placeholder = (
+                item.get_attribute("placeholder") or ""
+            )
+
             if (
                 "Слово для поиска" in placeholder
                 or "номер закупки" in placeholder
@@ -57,14 +141,15 @@ def main():
                 break
 
         if search_box is None:
-            print("ERROR: search input not found")
-            print("INPUTS FOUND:")
+            print("")
+            print("ERROR: real Samruk search input not found")
+            print("Page files saved to output/")
+            print("We do NOT use 'Ваш вопрос...' as tender search.")
+            raise RuntimeError(
+                "Samruk tender search input not found"
+            )
 
-            for item in inputs:
-                print(" -", item.get_attribute("placeholder"))
-
-            raise RuntimeError("Samruk search input not found")
-
+        print("")
         print("SEARCH INPUT FOUND")
         print("KEYWORD:", KEYWORD)
 
@@ -80,38 +165,40 @@ def main():
                     )
                 )
             )
+
             button.click()
+
         except Exception:
-            print("Search button not clicked - trying ENTER")
+            print(
+                "Search button not clicked - trying ENTER"
+            )
+
             search_box.send_keys(Keys.ENTER)
 
         print("SEARCH STARTED")
 
         time.sleep(8)
 
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-
-        print("RESULT URL:", driver.current_url)
-        print("PAGE TEXT LENGTH:", len(body_text))
-
-        OUT.joinpath("samruk_test.html").write_text(
-            driver.page_source,
-            encoding="utf-8"
-        )
-
-        OUT.joinpath("samruk_test.txt").write_text(
-            body_text,
-            encoding="utf-8"
+        body_text = save_page(
+            driver,
+            "samruk_after_search"
         )
 
         print("")
+        print("RESULT URL:", driver.current_url)
+        print("PAGE TEXT LENGTH:", len(body_text))
+
+        print("")
         print("LINES WITH KEYWORD:")
+
         found = 0
 
         for line in body_text.splitlines():
             if KEYWORD.lower() in line.lower():
                 print(line[:500])
+
                 found += 1
+
                 if found >= 20:
                     break
 
@@ -121,9 +208,14 @@ def main():
         if "По вашему запросу ничего не найдено" in body_text:
             print("SAMRUK RESULT: no matches shown")
         else:
-            print("SAMRUK RESULT: page responded to search")
+            print(
+                "SAMRUK RESULT: page responded to search"
+            )
 
-        print("SUCCESS: Samruk browser test completed")
+        print("")
+        print(
+            "SUCCESS: Samruk browser test completed"
+        )
 
     finally:
         driver.quit()
