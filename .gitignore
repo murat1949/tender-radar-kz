@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+output/
+logs/
+SEND_ME_*.zip
+auto_config.txt
+config.txt
+token.txt
+config.json
+telegram_token.txt
+telegram_chat_id.txt
+telegram_seen.json
+.env
