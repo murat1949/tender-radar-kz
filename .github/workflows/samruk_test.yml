@@ -1,0 +1,36 @@
+name: Tender Radar KZ - Samruk Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  samruk-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Samruk collector test
+        run: python -u samruk_collector.py
+
+      - name: Save Samruk test files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: samruk-test-output
+          path: output/
+          if-no-files-found: ignore
