@@ -230,7 +230,7 @@ def main():
     token=ensure_token()
 
     jobs=[
-      ("mitwork","mitwork_collector_v2.py",{},make_mitwork),
+     # ("mitwork","mitwork_collector_v2.py",{},make_mitwork),
       ("goszakup","collector_goszakup.py",{"GOSZAKUP_TOKEN":token,"TOKEN":token,"API_TOKEN":token},make_gos),
     ]
 
