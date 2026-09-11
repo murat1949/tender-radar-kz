@@ -220,6 +220,167 @@ def wait_for_cards(driver, timeout=WAIT_SECONDS):
     return driver.find_elements(By.CSS_SELECTOR, "div.m-sidebar__layout--found-item")
 
 
+def snapshot_cards(driver):
+    """
+    Снимает карточки одним JS-снимком.
+    Это устраняет StaleElementReferenceException: дальше работаем со строками,
+    а не с Selenium WebElement, которые Samruk может перерисовать.
+    """
+    try:
+        return driver.execute_script(
+            """
+            return Array.from(
+                document.querySelectorAll('div.m-sidebar__layout--found-item')
+            ).map(function(el) {
+                var titleEl =
+                    el.querySelector('.m-found-item__title') ||
+                    el.querySelector('.m-found-item__title--name') ||
+                    el.querySelector('h3') ||
+                    el.querySelector('h4');
+                return {
+                    text: (el.innerText || '').trim(),
+                    title: titleEl ? (titleEl.innerText || '').trim() : ''
+                };
+            });
+            """
+        ) or []
+    except Exception:
+        return []
+
+
+def snapshot_signature(items):
+    ids = []
+    for item in items or []:
+        m = re.search(r"№\s*(\d{5,})", str(item.get("text") or ""))
+        if m:
+            ids.append(m.group(1))
+    return tuple(ids)
+
+
+def wait_for_page_snapshot(driver, previous_signature=None, timeout=WAIT_SECONDS):
+    """
+    Ждём не просто наличия карточек, а фактического обновления SPA-страницы.
+    Иначе при переходе page=1 -> page=2 Selenium может успеть прочитать
+    ещё старые карточки первой страницы.
+    """
+    deadline = time.time() + timeout
+    last = []
+
+    while time.time() < deadline:
+        items = snapshot_cards(driver)
+        if items:
+            sig = snapshot_signature(items)
+            if previous_signature is None or sig != previous_signature:
+                return items
+            last = items
+
+        try:
+            body_text = driver.find_element(By.TAG_NAME, "body").text or ""
+            if "Найдено 0" in body_text:
+                return []
+        except Exception:
+            pass
+
+        time.sleep(0.35)
+
+    return last
+
+
+def parse_list_snapshot(item, keyword, page):
+    text = clean_text(item.get("text") or "")
+    title = clean_text(item.get("title") or "")
+
+    lot_match = re.search(r"№\s*(\d{5,})", text)
+    lot_id = lot_match.group(1) if lot_match else None
+    if not lot_id:
+        return None
+
+    if not title:
+        for line in lines_of(item.get("text") or ""):
+            if re.fullmatch(r"№\s*\d+", line):
+                continue
+            if line.lower().startswith(("осталось:", "стоимость:")):
+                continue
+            if len(line) >= 3:
+                title = line
+                break
+
+    method = None
+    remaining = None
+    amount_text = None
+    status_name = None
+
+    for line in lines_of(item.get("text") or ""):
+        low = line.lower()
+
+        if not method and (
+            "запрос ценовых" in low
+            or "открытый тендер" in low
+            or "тендер на понижение" in low
+            or "электронный магазин" in low
+            or "из одного источника" in low
+            or "аукцион" in low
+        ):
+            method = line
+
+        if line.startswith("Осталось:"):
+            remaining = clean_text(line.split(":", 1)[1])
+
+        if line.startswith("Стоимость:"):
+            amount_text = clean_text(line.split(":", 1)[1])
+
+        if (
+            "опубликован" in low
+            or "обсуждени" in low
+            or "прием заяв" in low
+            or "приём заяв" in low
+        ):
+            status_name = line
+
+    blob = f"{title} {text}"
+
+    return {
+        "source_code": "samruk",
+        "source_tender_id": None,
+        "source_lot_id": lot_id,
+        "public_url": lot_fallback_url(lot_id, keyword, page),
+        "title": title or f"Лот Samruk №{lot_id}",
+        "description": text,
+        "customer_name": None,
+        "customer_bin": None,
+        "region": None,
+        "procurement_method": method,
+        "status_code": None,
+        "status_name": status_name or "Опубликовано",
+        "amount": money_to_float(amount_text),
+        "currency": "KZT",
+        "quantity": None,
+        "unit": None,
+        "category": keyword,
+        "published_at": None,
+        "started_at": None,
+        "expires_at": remaining_to_expires_at(remaining),
+        "is_active": True,
+        "raw": {
+            "entity_level": "lot",
+            "keyword": keyword,
+            "page": page,
+            "remaining_text": remaining,
+            "amount_text": amount_text,
+            "list_text": text,
+            "is_service": is_service(blob),
+            "is_relevant_goods": is_relevant_goods(blob),
+            "documents_count": 0,
+            "document_urls": [],
+            "document_names": [],
+            "has_documents": False,
+            "has_techspec": False,
+            "parent_tender_id": None,
+            "detail_checked": False,
+        },
+    }
+
+
 def extract_card_title(card):
     for selector in [".m-found-item__title", ".m-found-item__title--name", "h3", "h4"]:
         try:
@@ -492,26 +653,11 @@ def find_card_by_lot_id(driver, lot_id):
 
 def click_lot_card(driver, lot_id):
     """
-    Открываем карточку именно кликом по найденному лоту.
-    Это ключевое отличие от нестабильного прямого перехода.
+    Открывает конкретный найденный лот одним JavaScript-действием.
+    Мы не храним WebElement между перерисовками Samruk, поэтому
+    StaleElementReferenceException здесь не возникает.
     """
-    card = find_card_by_lot_id(driver, lot_id)
-    if card is None:
-        raise RuntimeError(f"Lot card {lot_id} not found on current search page")
-
-    attempts = []
-
-    # 1. Обычный click.
-    try:
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block:'center'});",
-            card,
-        )
-        time.sleep(0.15)
-        card.click()
-        attempts.append("native")
-    except Exception:
-        pass
+    lot_id = str(lot_id)
 
     def detail_is_open(d):
         try:
@@ -519,50 +665,56 @@ def click_lot_card(driver, lot_id):
             body = d.find_element(By.TAG_NAME, "body").text or ""
             return (
                 f"/{lot_id}/lot" in url
-                and re.search(rf"№\s*{re.escape(str(lot_id))}\b", body) is not None
+                and re.search(rf"№\s*{re.escape(lot_id)}\b", body) is not None
             )
         except Exception:
             return False
 
-    try:
-        WebDriverWait(driver, 6).until(detail_is_open)
-        return
-    except Exception:
-        pass
+    script = r"""
+        var id = arguments[0];
+        var cards = Array.from(
+            document.querySelectorAll('div.m-sidebar__layout--found-item')
+        );
+        var re = new RegExp('№\\s*' + id + '\\b');
 
-    # 2. JS click по карточке.
-    card = find_card_by_lot_id(driver, lot_id)
-    if card is not None:
-        try:
-            driver.execute_script("arguments[0].click();", card)
-            attempts.append("js")
-            WebDriverWait(driver, 8).until(detail_is_open)
-            return
-        except Exception:
-            pass
+        for (var i = 0; i < cards.length; i++) {
+            var text = cards[i].innerText || '';
+            if (!re.test(text)) continue;
 
-    # 3. Иногда клик висит на заголовке внутри карточки.
-    card = find_card_by_lot_id(driver, lot_id)
-    if card is not None:
+            cards[i].scrollIntoView({block: 'center'});
+
+            var target =
+                cards[i].querySelector('a') ||
+                cards[i].querySelector('button') ||
+                cards[i].querySelector('.m-found-item__title') ||
+                cards[i].querySelector('.m-found-item__title--name') ||
+                cards[i];
+
+            target.click();
+            return true;
+        }
+        return false;
+    """
+
+    for attempt in range(1, 4):
+        clicked = False
         try:
-            candidates = card.find_elements(
-                By.CSS_SELECTOR,
-                "a, button, .m-found-item__title, .m-found-item__title--name"
-            )
-            for child in candidates:
-                try:
-                    driver.execute_script("arguments[0].click();", child)
-                    attempts.append("child-js")
-                    WebDriverWait(driver, 5).until(detail_is_open)
-                    return
-                except Exception:
-                    continue
+            clicked = bool(driver.execute_script(script, lot_id))
         except Exception:
-            pass
+            clicked = False
+
+        if clicked:
+            try:
+                WebDriverWait(driver, 8).until(detail_is_open)
+                return
+            except Exception:
+                pass
+
+        # Samruk мог перерисовать список — ждём его и повторяем поиск заново.
+        wait_for_page_snapshot(driver, timeout=4)
 
     raise RuntimeError(
-        f"Could not open lot {lot_id} by click; attempts={attempts}; "
-        f"url={driver.current_url}"
+        f"Could not open lot {lot_id} by fresh DOM click; url={driver.current_url}"
     )
 
 
@@ -741,7 +893,8 @@ def collect(driver):
     for keyword in KEYWORDS:
         print("")
         print("SEARCH LOTS:", keyword)
-        seen_signatures = set()
+
+        previous_signature = None
 
         for page in range(1, MAX_PAGES_PER_KEYWORD + 1):
             search_url = lot_search_url(keyword, page)
@@ -752,24 +905,43 @@ def collect(driver):
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
 
-            cards = wait_for_cards(driver)
-            print("  CARDS:", len(cards))
+            items = wait_for_page_snapshot(
+                driver,
+                previous_signature=previous_signature,
+                timeout=WAIT_SECONDS,
+            )
+            print("  CARDS:", len(items))
 
-            if not cards:
+            if not items:
                 break
 
-            page_ids = []
+            signature = snapshot_signature(items)
+
+            # Если SPA так и не переключилась на следующую страницу,
+            # один раз повторяем прямой переход и ждём ещё.
+            if previous_signature is not None and signature == previous_signature:
+                print("  RETRY: page content did not change yet")
+                driver.get(search_url)
+                items = wait_for_page_snapshot(
+                    driver,
+                    previous_signature=previous_signature,
+                    timeout=8,
+                )
+                signature = snapshot_signature(items)
+
+            if previous_signature is not None and signature == previous_signature:
+                print("  STOP: repeated page signature after retry")
+                break
+
+            previous_signature = signature
             new_on_page = 0
 
-            # Сначала снимаем список карточек без кликов.
-            parsed_page_rows = []
-            for card in cards:
-                row = parse_list_card(card, keyword, page)
+            for item in items:
+                row = parse_list_snapshot(item, keyword, page)
                 if not row:
                     continue
 
                 lot_id = row["source_lot_id"]
-                page_ids.append(lot_id)
 
                 if row["raw"]["is_service"]:
                     print("    SKIP SERVICE:", lot_id, row["title"])
@@ -781,7 +953,6 @@ def collect(driver):
 
                 if lot_id not in rows_by_id:
                     rows_by_id[lot_id] = row
-                    parsed_page_rows.append(row)
                     new_on_page += 1
                     print("    LOT:", lot_id, "|", row["title"])
                 else:
@@ -790,14 +961,8 @@ def collect(driver):
                     if keyword not in matched:
                         matched.append(keyword)
 
-            # Сразу сохраняем список, чтобы не потерять его при сбое детали.
+            # Сохраняем после каждой страницы.
             save_results(list(rows_by_id.values()))
-
-            signature = tuple(page_ids)
-            if signature in seen_signatures:
-                print("  STOP: repeated page signature")
-                break
-            seen_signatures.add(signature)
 
             if new_on_page == 0 and page > 1:
                 print("  STOP: no new relevant lots")
@@ -874,7 +1039,7 @@ def main():
     print("=" * 78)
     print("TENDER RADAR KZ - SAMRUK LOT COLLECTOR")
     print("ENTITY LEVEL: LOT")
-    print("DETAIL OPEN METHOD: CLICK FOUND LOT CARD")
+    print("DETAIL OPEN METHOD: FRESH DOM CLICK (NO STALE ELEMENTS)")
     print("MODE: READ ONLY, NO SUPABASE WRITE")
     print("=" * 78)
 
