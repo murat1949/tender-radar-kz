@@ -25,6 +25,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run Samruk collector test
+        env:
+          SAMRUK_DETAIL_LIMIT: "3"
         run: python -u samruk_collector.py
 
       - name: Save Samruk test files
