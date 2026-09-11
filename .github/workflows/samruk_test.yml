@@ -25,7 +25,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run Samruk collector test
-        run: python -u samruk_collector_v3.py
+        python -u samruk_collector.py
 
       - name: Save Samruk test files
         if: always()
