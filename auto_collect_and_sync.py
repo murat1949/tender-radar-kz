@@ -1,271 +1,382 @@
 # -*- coding: utf-8 -*-
-import os, sys, json, subprocess, time, getpass, urllib.request, urllib.error
+
+import os
+import sys
+import json
+import subprocess
+import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-OUT = ROOT/"output"
-LOGS = ROOT/"logs"
+OUT = ROOT / "output"
+LOGS = ROOT / "logs"
+OUT.mkdir(exist_ok=True)
 LOGS.mkdir(exist_ok=True)
 
+
 def read_cfg(path):
-    cfg={}
+    cfg = {}
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
-            line=line.strip()
+            line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            k,v=line.split("=",1)
-            cfg[k.strip()]=v.strip()
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip()
     except Exception:
         pass
     return cfg
 
-def find_supabase_config():
-    env_cfg = {
+
+def get_config():
+    cfg = {
         "SUPABASE_URL": os.getenv("SUPABASE_URL", "").strip(),
         "SUPABASE_SERVICE_ROLE_KEY": os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip(),
+        "GOSZAKUP_TOKEN": os.getenv("GOSZAKUP_TOKEN", "").strip(),
     }
-    if env_cfg["SUPABASE_URL"] and env_cfg["SUPABASE_SERVICE_ROLE_KEY"]:
-        return "environment", env_cfg
 
-    candidates=[ROOT/"config.txt"]
-    try:
-        candidates += list(ROOT.parent.glob("*/config.txt"))
-    except Exception:
-        pass
-    for p in candidates:
+    if not cfg["SUPABASE_URL"] or not cfg["SUPABASE_SERVICE_ROLE_KEY"]:
+        for p in (ROOT / "config.txt", ROOT.parent / "config.txt"):
+            if not p.exists():
+                continue
+            local = read_cfg(p)
+            if not cfg["SUPABASE_URL"]:
+                cfg["SUPABASE_URL"] = local.get("SUPABASE_URL", "").strip()
+            if not cfg["SUPABASE_SERVICE_ROLE_KEY"]:
+                cfg["SUPABASE_SERVICE_ROLE_KEY"] = local.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+    if not cfg["GOSZAKUP_TOKEN"]:
+        p = ROOT / "auto_config.txt"
         if p.exists():
-            c=read_cfg(p)
-            if c.get("SUPABASE_URL") and c.get("SUPABASE_SERVICE_ROLE_KEY"):
-                return p,c
-    return None,{}
+            local = read_cfg(p)
+            cfg["GOSZAKUP_TOKEN"] = local.get("GOSZAKUP_TOKEN", "").strip()
 
-def ensure_token():
-    token=os.getenv("GOSZAKUP_TOKEN","").strip()
-    if token:
-        return token
+    missing = [k for k in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "GOSZAKUP_TOKEN") if not cfg.get(k)]
+    if missing:
+        raise RuntimeError("Missing configuration: " + ", ".join(missing))
+    return cfg
 
-    if os.getenv("GITHUB_ACTIONS","").lower()=="true":
-        raise RuntimeError("GitHub Secret GOSZAKUP_TOKEN is not configured")
-
-    p=ROOT/"auto_config.txt"
-    cfg=read_cfg(p) if p.exists() else {}
-    token=cfg.get("GOSZAKUP_TOKEN","").strip()
-    if token:
-        return token
-
-    print()
-    print("ONE-TIME LOCAL SETUP FOR GOSZAKUP")
-    token=getpass.getpass("GOSZAKUP_TOKEN: ").strip()
-    if not token:
-        raise RuntimeError("Goszakup token is empty")
-    p.write_text("# ProcureVision AUTO local settings\nGOSZAKUP_TOKEN="+token+"\n",encoding="utf-8")
-    print("Token saved locally in auto_config.txt.")
-    return token
-
-def run_collector(name, script, env=None):
-    log=LOGS/(name+"_collector.log")
-    print()
-    print("="*64)
-    print("COLLECT:",name.upper())
-    print("="*64)
-
-    e=os.environ.copy()
-    # Child collectors only collect to JSON. Parent alone writes to Supabase.
-    e.pop("SUPABASE_URL", None)
-    e.pop("SUPABASE_SERVICE_ROLE_KEY", None)
-    if env:
-        e.update(env)
-
-    p=subprocess.Popen([sys.executable, str(ROOT/script)], cwd=str(ROOT), env=e,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                       universal_newlines=True, bufsize=1)
-    lines=[]
-    for line in p.stdout:
-        print(line.rstrip())
-        lines.append(line)
-    code=p.wait()
-    log.write_text("".join(lines),encoding="utf-8",errors="replace")
-    if code!=0:
-        raise RuntimeError("%s collector failed with code %s" % (name,code))
 
 def nempty(v):
-    if v is None: return None
-    if isinstance(v,str):
-        v=v.strip()
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
         return v if v else None
     return v
 
-def iso_or_none(v):
-    return nempty(v)
-
-
-def dt(v):
-    if not v:
-        return None
-    import re as _re
-    s=str(v)
-    m=_re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", s)
-    if m:
-        return m.group(0).replace(" ","T")
-    m=_re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", s)
-    if m:
-        return m.group(0)
-    return None
 
 def load_json(path):
+    if not path.exists():
+        raise RuntimeError("Output file not found: %s" % path)
     return json.loads(path.read_text(encoding="utf-8"))
 
-def make_mitwork():
-    ann=load_json(OUT/"mitwork_announcements.json")
-    out=[]
-    for a in ann:
-        if not isinstance(a,dict):
+
+def run_script(label, script_name, env_extra=None):
+    script = ROOT / script_name
+    if not script.exists():
+        raise RuntimeError("Script not found: %s" % script_name)
+
+    print()
+    print("=" * 70)
+    print("COLLECT:", label.upper())
+    print("SCRIPT :", script_name)
+    print("=" * 70)
+
+    env = os.environ.copy()
+    if env_extra:
+        env.update(env_extra)
+
+    p = subprocess.Popen(
+        [sys.executable, "-u", str(script)],
+        cwd=str(ROOT),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        bufsize=1,
+    )
+
+    lines = []
+    for line in p.stdout:
+        print(line.rstrip())
+        lines.append(line)
+    code = p.wait()
+
+    (LOGS / (label + "_collector.log")).write_text(
+        "".join(lines), encoding="utf-8", errors="replace"
+    )
+
+    if code != 0:
+        raise RuntimeError("%s collector failed with code %s" % (label, code))
+
+
+def make_samruk():
+    rows = load_json(OUT / "samruk_tenders.json")
+    out = []
+
+    for r in rows:
+        if not isinstance(r, dict):
             continue
-        tender_id=str(a.get("external_id") or a.get("announcement_number") or "").strip()
-        lots=a.get("lots") if isinstance(a.get("lots"),list) else []
-        if not lots:
-            lots=[{}]
-        for i,lot in enumerate(lots,1):
-            lot_number=str(lot.get("lot_number") or i).strip()
-            source_lot_id=(tender_id+":"+lot_number) if tender_id else lot_number
-            subject=str(lot.get("subject") or a.get("title") or "").strip()
-            desc=str(lot.get("description") or "").strip()
-            out.append({
-                "source_code":"samruk",
-                "source_tender_id":tender_id or None,
-                "source_lot_id":source_lot_id or None,
-                "public_url":a.get("public_url"),
-                "title":subject or str(a.get("title") or "").strip(),
-                "description":desc,
-                "customer_name":a.get("organizer"),
-                "customer_bin":None,
-                "region":None,
-                "procurement_method":a.get("procurement_method"),
-                "status_code":None,
-                "status_name":a.get("status"),
-                "amount":lot.get("total_price_kzt") if lot.get("total_price_kzt") is not None else a.get("amount_kzt"),
-                "currency":"KZT",
-                "quantity":lot.get("quantity"),
-                "unit":None,
-                "category":a.get("procurement_type"),
-                "published_at":None,
-                "started_at":dt(a.get("start_date")),
-                "expires_at":dt(a.get("end_date")),
-                "is_active":str(a.get("status") or "").lower() in ("опубликовано","прием заявок","приём заявок"),
-                "raw":{"announcement":a,"lot":lot}
-            })
+        lot_id = str(r.get("source_lot_id") or "").strip()
+        if not lot_id:
+            continue
+
+        out.append({
+            "source_code": "samruk",
+            "source_tender_id": nempty(r.get("source_tender_id")),
+            "source_lot_id": lot_id,
+            "public_url": nempty(r.get("public_url")),
+            "title": nempty(r.get("title")),
+            "description": nempty(r.get("description")),
+            "customer_name": nempty(r.get("customer_name")),
+            "customer_bin": nempty(r.get("customer_bin")),
+            "region": nempty(r.get("region")),
+            "procurement_method": nempty(r.get("procurement_method")),
+            "status_code": nempty(r.get("status_code")),
+            "status_name": nempty(r.get("status_name")) or "Опубликовано",
+            "amount": r.get("amount"),
+            "currency": nempty(r.get("currency")) or "KZT",
+            "quantity": r.get("quantity"),
+            "unit": nempty(r.get("unit")),
+            "category": nempty(r.get("category")),
+            "published_at": nempty(r.get("published_at")),
+            "started_at": nempty(r.get("started_at")),
+            "expires_at": nempty(r.get("expires_at")),
+            "is_active": bool(r.get("is_active", True)),
+            "raw": r.get("raw") if isinstance(r.get("raw"), dict) else r,
+        })
+
     return out
 
-def make_gos():
-    rows=load_json(OUT/"tenders.json")
-    out=[]
+
+
+def validate_samruk_lots(rows):
+    """
+    Защита от возврата к старой ошибочной логике "закупка вместо лота".
+    В основной sync допускаются только строки Samruk уровня LOT.
+    """
+    bad = []
     for r in rows:
-        ext=str(r.get("external_id") or "").strip()
-        lotnum=str(r.get("lot_number") or "").strip()
-        ann=str(r.get("announcement_number") or "").strip()
-        sid=ext or lotnum or ann
-        status=str(r.get("status") or "")
+        lot_id = str(r.get("source_lot_id") or "").strip()
+        url = str(r.get("public_url") or "").strip()
+        if not lot_id or "/lot" not in url:
+            bad.append((lot_id, url))
+
+    if bad:
+        preview = bad[:5]
+        raise RuntimeError(
+            "SAMRUK ARCHITECTURE CHECK FAILED: "
+            f"{len(bad)} rows are not LOT-level. Sample: {preview}"
+        )
+
+    print("SAMRUK ARCHITECTURE CHECK: OK - LOT level only")
+    return True
+
+
+def make_goszakup():
+    rows = load_json(OUT / "tenders.json")
+    out = []
+
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+
+        ext = str(r.get("external_id") or "").strip()
+        lotnum = str(r.get("lot_number") or "").strip()
+        ann = str(r.get("announcement_number") or "").strip()
+        sid = ext or lotnum or ann
+        if not sid:
+            continue
+
+        status = str(r.get("status") or "")
+
         out.append({
-          "source_code":"goszakup","source_tender_id":ann or None,"source_lot_id":sid or None,
-          "public_url":nempty(r.get("public_url")),"title":nempty(r.get("title")),
-          "description":nempty(r.get("description")),"customer_name":nempty(r.get("customer_name")),
-          "customer_bin":nempty(r.get("customer_bin")),"region":None,
-          "procurement_method":nempty(r.get("trade_method")),"status_code":None,
-          "status_name":nempty(status),"amount":r.get("amount_kzt"),"currency":"KZT",
-          "quantity":r.get("quantity"),"unit":None,"category":None,
-          "published_at":iso_or_none(r.get("publish_date")),"started_at":iso_or_none(r.get("start_date")),
-          "expires_at":iso_or_none(r.get("end_date")),
-          "is_active":("прием" in status.lower() or "приём" in status.lower()),"raw":r
+            "source_code": "goszakup",
+            "source_tender_id": ann or None,
+            "source_lot_id": sid,
+            "public_url": nempty(r.get("public_url")),
+            "title": nempty(r.get("title")),
+            "description": nempty(r.get("description")),
+            "customer_name": nempty(r.get("customer_name")),
+            "customer_bin": nempty(r.get("customer_bin")),
+            "region": nempty(r.get("region")),
+            "procurement_method": nempty(r.get("trade_method")),
+            "status_code": nempty(r.get("status_code")),
+            "status_name": nempty(status),
+            "amount": r.get("amount_kzt"),
+            "currency": "KZT",
+            "quantity": r.get("quantity"),
+            "unit": nempty(r.get("unit")),
+            "category": nempty(r.get("category")),
+            "published_at": nempty(r.get("publish_date")),
+            "started_at": nempty(r.get("start_date")),
+            "expires_at": nempty(r.get("end_date")),
+            "is_active": ("прием" in status.lower() or "приём" in status.lower()),
+            "raw": r,
         })
+
     return out
+
 
 def upload_rows(cfg, source, rows):
-    endpoint=cfg["SUPABASE_URL"].rstrip("/")+"/rest/v1/tenders?on_conflict=source_code,source_lot_id"
-    key=cfg["SUPABASE_SERVICE_ROLE_KEY"]
-    headers={"apikey":key,"Authorization":"Bearer "+key,"Content-Type":"application/json",
-             "Prefer":"resolution=merge-duplicates,return=minimal"}
-    batch_size=100
-    sent=0
-    for start in range(0,len(rows),batch_size):
-        batch=rows[start:start+batch_size]
-        req=urllib.request.Request(endpoint,
-            data=json.dumps(batch,ensure_ascii=False).encode("utf-8"),
-            headers=headers,method="POST")
+    if not rows:
+        print("WARNING:", source, "returned 0 rows.")
+        print("Existing rows in Supabase are NOT deleted.")
+        return 0
+
+    endpoint = (
+        cfg["SUPABASE_URL"].rstrip("/")
+        + "/rest/v1/tenders?on_conflict=source_code,source_lot_id"
+    )
+    key = cfg["SUPABASE_SERVICE_ROLE_KEY"]
+    headers = {
+        "apikey": key,
+        "Authorization": "Bearer " + key,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }
+
+    sent = 0
+    for start in range(0, len(rows), 100):
+        batch = rows[start:start + 100]
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(batch, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
         try:
-            with urllib.request.urlopen(req,timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=120) as resp:
                 resp.read()
             sent += len(batch)
-            print("SYNC",source,":",sent,"/",len(rows))
+            print("SYNC", source, ":", sent, "/", len(rows))
         except urllib.error.HTTPError as e:
-            body=e.read().decode("utf-8",errors="replace")
-            print("SUPABASE HTTP ERROR",source,":",e.code)
+            body = e.read().decode("utf-8", errors="replace")
+            print("SUPABASE HTTP ERROR", source, ":", e.code)
             print(body)
             raise
+
     return sent
 
+
 def update_source(cfg, source, ok=True, err=None):
-    endpoint=cfg["SUPABASE_URL"].rstrip("/")+"/rest/v1/sources?code=eq."+source
-    key=cfg["SUPABASE_SERVICE_ROLE_KEY"]
-    body={"last_run_at":time.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    endpoint = cfg["SUPABASE_URL"].rstrip("/") + "/rest/v1/sources?code=eq." + source
+    key = cfg["SUPABASE_SERVICE_ROLE_KEY"]
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    body = {"last_run_at": now}
+
     if ok:
-        body["last_success_at"]=body["last_run_at"]; body["last_error"]=None; body["status"]="ready"
+        body["last_success_at"] = now
+        body["last_error"] = None
+        body["status"] = "ready"
     else:
-        body["last_error"]=str(err); body["status"]="error"
-    req=urllib.request.Request(endpoint,data=json.dumps(body).encode("utf-8"),
-        headers={"apikey":key,"Authorization":"Bearer "+key,"Content-Type":"application/json","Prefer":"return=minimal"},
-        method="PATCH")
+        body["last_error"] = str(err)
+        body["status"] = "error"
+
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "apikey": key,
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        method="PATCH",
+    )
+
     try:
-        with urllib.request.urlopen(req,timeout=30) as resp: resp.read()
-    except Exception:
-        pass
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+    except Exception as e:
+        print("WARNING: source status update failed:", source, repr(e))
+
 
 def main():
-    cfg_path,cfg=find_supabase_config()
-    if not cfg:
-        print("ERROR: configured Supabase config.txt not found.")
-        print("Put this AUTO folder beside your previous ProcureVision folders.")
+    print("=" * 70)
+    print("TENDER RADAR KZ - CLOUD AUTO COLLECT - LOT ARCHITECTURE")
+    print("SOURCES: SAMRUK + GOSZAKUP")
+    print("MITWORK: DISABLED")
+    print("=" * 70)
+
+    try:
+        cfg = get_config()
+    except Exception as e:
+        print("CONFIG ERROR:", repr(e))
         return 2
-    print("Supabase config source:",cfg_path)
-    token=ensure_token()
 
-    jobs=[
-     # ("mitwork","mitwork_collector_v2.py",{},make_mitwork),
-      ("goszakup","collector_goszakup.py",{"GOSZAKUP_TOKEN":token,"TOKEN":token,"API_TOKEN":token},make_gos),
-    ]
+    totals = {}
 
-    totals={}
-    for name,script,env,maker in jobs:
-        public_source = "samruk" if name=="mitwork" else name
-        try:
-            run_collector(name,script,env)
-            rows=maker()
-            print("Prepared for Supabase:",len(rows))
-            if name=="goszakup" and len(rows)==0:
-                print("WARNING: Goszakup returned 0 current keyword matches.")
-                print("Existing Goszakup rows in Supabase are NOT deleted.")
-                totals[public_source]=0
-                update_source(cfg,public_source,True)
-            else:
-                totals[public_source]=upload_rows(cfg,public_source,rows)
-                update_source(cfg,public_source,True)
-        except Exception as e:
-            print("ERROR",public_source,":",repr(e))
-            update_source(cfg,public_source,False,e)
-            totals[public_source]="ERROR"
+    try:
+        old = OUT / "samruk_tenders.json"
+        if old.exists():
+            old.unlink()
+
+        run_script(
+            "samruk",
+            "samruk_collector.py",
+            {
+                # В основном облачном цикле подробно открываем только несколько
+                # лотов, чтобы обновление не растягивалось на десятки минут.
+                # Все найденные лоты всё равно сохраняются из списка Samruk.
+                "SAMRUK_DETAIL_LIMIT": os.getenv("SAMRUK_DETAIL_LIMIT", "3"),
+            },
+        )
+        rows = make_samruk()
+        validate_samruk_lots(rows)
+        print("Prepared for Supabase:", len(rows))
+        totals["samruk"] = upload_rows(cfg, "samruk", rows)
+        update_source(cfg, "samruk", True)
+
+    except Exception as e:
+        print("ERROR samruk:", repr(e))
+        update_source(cfg, "samruk", False, e)
+        totals["samruk"] = "ERROR"
+
+    try:
+        old = OUT / "tenders.json"
+        if old.exists():
+            old.unlink()
+
+        token = cfg["GOSZAKUP_TOKEN"]
+        run_script(
+            "goszakup",
+            "collector_goszakup.py",
+            {
+                "GOSZAKUP_TOKEN": token,
+                "TOKEN": token,
+                "API_TOKEN": token,
+            },
+        )
+
+        rows = make_goszakup()
+        print("Prepared for Supabase:", len(rows))
+        totals["goszakup"] = upload_rows(cfg, "goszakup", rows)
+        update_source(cfg, "goszakup", True)
+
+    except Exception as e:
+        print("ERROR goszakup:", repr(e))
+        update_source(cfg, "goszakup", False, e)
+        totals["goszakup"] = "ERROR"
 
     print()
-    print("="*64)
-    print("PROCUREVISION AUTO RESULT")
-    print("="*64)
-    for k,v in totals.items():
-        print(k,":",v)
+    print("=" * 70)
+    print("TENDER RADAR KZ - AUTO RESULT")
+    print("=" * 70)
+    for source, total in totals.items():
+        print(source, ":", total)
     print()
-    if all(v!="ERROR" for v in totals.values()):
+
+    if all(v != "ERROR" for v in totals.values()):
         print("SUCCESS: Samruk and Goszakup update completed.")
         return 0
-    print("DONE WITH ERRORS. See logs folder.")
+
+    print("DONE WITH ERRORS. See collector logs.")
     return 1
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     sys.exit(main())
