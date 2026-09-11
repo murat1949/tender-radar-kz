@@ -529,7 +529,9 @@ def label_value_from_lines(text, labels):
 
 def date_for_labels(text, labels):
     """
-    Ищет дату в той же строке, на следующих строках и в нормализованном тексте.
+    Ищет ближайшую дату около нужной подписи Samruk.
+    SPA может вставлять между подписью и датой несколько служебных строк,
+    поэтому смотрим расширенное окно, а не только 4 строки.
     """
     raw_lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
 
@@ -538,20 +540,33 @@ def date_for_labels(text, labels):
         for label in labels:
             lab = clean_text(label).lower()
             if lab in low:
+                # 1) дата может быть в той же строке
                 parsed = parse_ru_datetime(line)
                 if parsed:
                     return parsed
 
-                for j in range(i + 1, min(i + 5, len(raw_lines))):
+                # 2) или в следующих строках DOM; берём ближайшую дату
+                for j in range(i + 1, min(i + 16, len(raw_lines))):
                     parsed = parse_ru_datetime(raw_lines[j])
                     if parsed:
                         return parsed
 
+                # 3) иногда дата попадает перед подписью в DOM-порядке
+                for j in range(i - 1, max(-1, i - 6), -1):
+                    parsed = parse_ru_datetime(raw_lines[j])
+                    if parsed:
+                        return parsed
+
+    # Последний резерв: большое нормализованное окно вокруг подписи.
     normalized = clean_text(text)
+    low_norm = normalized.lower()
     for label in labels:
-        pos = normalized.lower().find(clean_text(label).lower())
+        lab = clean_text(label).lower()
+        pos = low_norm.find(lab)
         if pos >= 0:
-            window = normalized[pos:pos + 220]
+            left = max(0, pos - 180)
+            right = min(len(normalized), pos + 700)
+            window = normalized[left:right]
             parsed = parse_ru_datetime(window)
             if parsed:
                 return parsed
@@ -571,7 +586,7 @@ def wait_for_detail_text(driver, lot_id, timeout=WAIT_SECONDS):
             body = d.execute_script("return document.body ? document.body.innerText : ''") or ""
             if f"/{lot_id}/lot" not in url:
                 return False
-            if re.search(rf"№\\s*{re.escape(lot_id)}\\b", body) is None:
+            if re.search(rf"№\s*{re.escape(lot_id)}\b", body) is None:
                 return False
             markers = (
                 "ЗАКАЗЧИК",
@@ -605,8 +620,14 @@ def extract_parent_tender_id_by_click(driver):
     try:
         elems = driver.find_elements(
             By.XPATH,
-            "//*[contains(normalize-space(.),'Перейти на закупку')]"
+            "//a[contains(normalize-space(.),'Перейти на закупку')] | "
+            "//button[contains(normalize-space(.),'Перейти на закупку')]"
         )
+        if not elems:
+            elems = driver.find_elements(
+                By.XPATH,
+                "//*[normalize-space(.)='Перейти на закупку']"
+            )
     except Exception:
         elems = []
 
@@ -627,9 +648,9 @@ def extract_parent_tender_id_by_click(driver):
             blob = " ".join(clean_text(x) for x in parts if x)
 
             for pattern in [
-                r"item/(\\d{5,})/advert",
-                r"advert[^0-9]{0,30}(\\d{5,})",
-                r"(\\d{5,})[^0-9]{0,30}advert",
+                r"item/(\d{5,})/advert",
+                r"advert[^0-9]{0,30}(\d{5,})",
+                r"(\d{5,})[^0-9]{0,30}advert",
             ]:
                 m = re.search(pattern, blob, re.I)
                 if m:
@@ -665,8 +686,8 @@ def extract_parent_tender_id_by_click(driver):
             tender_url = driver.current_url or ""
             tender_id = None
             for pattern in [
-                r"item/(\\d{5,})/advert",
-                r"[?&]q=(\\d{5,})",
+                r"item/(\d{5,})/advert",
+                r"[?&]q=(\d{5,})",
             ]:
                 m = re.search(pattern, tender_url, re.I)
                 if m:
@@ -950,16 +971,14 @@ def enrich_from_open_detail(driver, row):
     ]
     row["description"] = clean_text(" | ".join(x for x in parts if x))
 
-    diagnostic_lines = [
-        clean_text(line)
-        for line in str(body or "").splitlines()
+    body_lines = [clean_text(line) for line in str(body or "").splitlines() if clean_text(line)]
+    diagnostic_lines = []
+    for i, line in enumerate(body_lines):
         if any(marker in line.upper() for marker in (
-            "НАЧАЛО",
-            "КОНЕЦ",
-            "ЗАКАЗЧИК",
-            "ПЕРЕЙТИ НА ЗАКУПКУ",
-        ))
-    ][:30]
+            "НАЧАЛО", "КОНЕЦ", "ЗАКАЗЧИК", "ПЕРЕЙТИ НА ЗАКУПКУ"
+        )):
+            diagnostic_lines.extend(body_lines[i:min(i + 5, len(body_lines))])
+    diagnostic_lines = diagnostic_lines[:40]
 
     row["raw"].update({
         "detail_checked": True,
