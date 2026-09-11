@@ -2,19 +2,20 @@
 """
 Tender Radar KZ — Samruk LOT collector
 
-Главный принцип:
+Единая архитектура:
     Samruk -> ЛОТ -> Tender Radar
 
-Сборщик:
-- работает только с вкладкой "Лоты";
-- ищет товарные лоты по ключевым словам;
-- исключает услуги;
-- сохраняет source_lot_id как номер ЛОТА;
-- формирует прямую ссылку именно на карточку ЛОТА;
-- по возможности открывает карточку лота и добирает:
-  заказчика, место поставки, краткую характеристику,
-  точные даты, документы и номер родительской закупки;
-- НЕ пишет в Supabase сам. Это делает общий cloud-sync.
+Что изменено относительно предыдущего варианта:
+- поиск остаётся строго по вкладке "Лоты";
+- подробная карточка открывается КЛИКОМ по найденному лоту,
+  а не прямым переходом по popup-URL;
+- прямой URL сохраняется уже после успешного клика;
+- даты ищутся устойчивее: и в той же строке, и на соседних строках;
+- после каждой карточки возврат идёт в тот же список/страницу;
+- результаты сохраняются до и во время подробной проверки,
+  поэтому даже прерванный запуск не теряет уже найденные лоты;
+- услуги исключаются;
+- сам сборщик НЕ пишет в Supabase. Это делает общий cloud-sync.
 
 Выход:
     output/samruk_tenders.json
@@ -46,12 +47,17 @@ KEYWORDS = [
 ]
 
 MAX_PAGES_PER_KEYWORD = int(os.getenv("SAMRUK_MAX_PAGES", "12"))
-DETAIL_LIMIT = int(os.getenv("SAMRUK_DETAIL_LIMIT", "120"))
-WAIT_SECONDS = int(os.getenv("SAMRUK_WAIT_SECONDS", "40"))
+WAIT_SECONDS = int(os.getenv("SAMRUK_WAIT_SECONDS", "25"))
+
+# 0 = проверить подробно все найденные лоты.
+# В тестовом workflow сейчас SAMRUK_DETAIL_LIMIT=3.
+DETAIL_LIMIT = int(os.getenv("SAMRUK_DETAIL_LIMIT", "0"))
 
 OUT = Path("output")
 OUT.mkdir(exist_ok=True)
 
+# Время портала Samruk отображается как локальное время Казахстана.
+# Для наших задач достаточно фиксированного UTC+5.
 KZ_TZ = timezone(timedelta(hours=5))
 
 RU_MONTHS = {
@@ -100,9 +106,7 @@ def lines_of(text):
 
 
 def money_to_float(value):
-    s = str(value or "")
-    s = s.replace("\xa0", " ").replace("₸", "").strip()
-    # Сохраняем десятичную часть и убираем разделители тысяч.
+    s = str(value or "").replace("\xa0", " ").replace("₸", "").strip()
     s = re.sub(r"(?<=\d)\s+(?=\d{3}(?:\D|$))", "", s)
     s = s.replace(" ", "").replace(",", ".")
     m = re.search(r"-?\d+(?:\.\d+)?", s)
@@ -118,11 +122,6 @@ def number_to_float(value):
 
 
 def parse_ru_datetime(text):
-    """
-    Пример Samruk:
-        17 сентября 2026 г., 10:00
-        11 сентября 2026 г., 16:59
-    """
     s = clean_text(text).lower()
     m = re.search(
         r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})\s*г?\.?,?\s*(\d{1,2}):(\d{2})",
@@ -132,23 +131,22 @@ def parse_ru_datetime(text):
     if not m:
         return None
 
-    day = int(m.group(1))
     month = RU_MONTHS.get(m.group(2))
-    year = int(m.group(3))
-    hour = int(m.group(4))
-    minute = int(m.group(5))
-
     if not month:
         return None
 
-    dt = datetime(year, month, day, hour, minute, tzinfo=KZ_TZ)
+    dt = datetime(
+        int(m.group(3)),
+        month,
+        int(m.group(1)),
+        int(m.group(4)),
+        int(m.group(5)),
+        tzinfo=KZ_TZ,
+    )
     return dt.isoformat()
 
 
 def remaining_to_expires_at(text):
-    """
-    Резервный вариант, если точная дата не считалась из карточки лота.
-    """
     s = clean_text(text).lower()
     delta = timedelta()
 
@@ -189,9 +187,7 @@ def lot_search_url(keyword, page=1):
     )
 
 
-def lot_public_url(lot_id, keyword="картридж", page=1):
-    # Формат подтвержден вручную на реальной карточке Samruk:
-    # .../#/ext(popup:item/4530311/lot)?tabs=lot&q=картридж&...
+def lot_fallback_url(lot_id, keyword="картридж", page=1):
     return (
         f"{BASE_URL}/#/ext(popup:item/{lot_id}/lot)?"
         f"tabs=lot&q={quote(keyword)}&adst=ALL&lst=ALL&page={int(page)}"
@@ -211,34 +207,21 @@ def make_driver():
 
 
 def wait_for_cards(driver, timeout=WAIT_SECONDS):
-    wait = WebDriverWait(driver, timeout)
     try:
-        wait.until(
+        WebDriverWait(driver, timeout).until(
             lambda d: (
-                len(d.find_elements(
-                    By.CSS_SELECTOR,
-                    "div.m-sidebar__layout--found-item"
-                )) > 0
+                len(d.find_elements(By.CSS_SELECTOR, "div.m-sidebar__layout--found-item")) > 0
                 or "Найдено 0" in (d.find_element(By.TAG_NAME, "body").text or "")
             )
         )
     except Exception:
         pass
 
-    return driver.find_elements(
-        By.CSS_SELECTOR,
-        "div.m-sidebar__layout--found-item"
-    )
+    return driver.find_elements(By.CSS_SELECTOR, "div.m-sidebar__layout--found-item")
 
 
 def extract_card_title(card):
-    selectors = [
-        ".m-found-item__title",
-        ".m-found-item__title--name",
-        "h3",
-        "h4",
-    ]
-    for selector in selectors:
+    for selector in [".m-found-item__title", ".m-found-item__title--name", "h3", "h4"]:
         try:
             value = clean_text(card.find_element(By.CSS_SELECTOR, selector).text)
             if value:
@@ -246,15 +229,13 @@ def extract_card_title(card):
         except Exception:
             pass
 
-    ls = lines_of(card.text)
-    for line in ls:
+    for line in lines_of(card.text):
         if re.fullmatch(r"№\s*\d+", line):
             continue
         if line.lower().startswith(("осталось:", "стоимость:")):
             continue
         if len(line) >= 3:
             return line
-
     return ""
 
 
@@ -268,7 +249,6 @@ def parse_list_card(card, keyword, page):
         return None
 
     title = extract_card_title(card)
-
     method = None
     remaining = None
     amount_text = None
@@ -305,9 +285,9 @@ def parse_list_card(card, keyword, page):
 
     return {
         "source_code": "samruk",
-        "source_tender_id": None,       # родительская закупка добирается из карточки лота
-        "source_lot_id": lot_id,        # КЛЮЧЕВОЕ: здесь номер ЛОТА
-        "public_url": lot_public_url(lot_id, keyword, page),
+        "source_tender_id": None,
+        "source_lot_id": lot_id,
+        "public_url": lot_fallback_url(lot_id, keyword, page),
         "title": title or f"Лот Samruk №{lot_id}",
         "description": clean_text(text),
         "customer_name": None,
@@ -336,35 +316,66 @@ def parse_list_card(card, keyword, page):
             "is_relevant_goods": is_relevant_goods(blob),
             "documents_count": 0,
             "document_urls": [],
+            "document_names": [],
             "has_documents": False,
             "has_techspec": False,
             "parent_tender_id": None,
+            "detail_checked": False,
         },
     }
 
 
-def value_after_label(text, labels):
+def label_value_from_lines(text, labels):
+    """
+    Ищет значение после подписи и в соседней строке, и в той же строке.
+    """
     ls = lines_of(text)
-    wanted = [x.lower() for x in labels]
+    labels_low = [clean_text(x).lower() for x in labels]
 
     for i, line in enumerate(ls):
         low = line.lower()
-        if any(low == w or low.startswith(w) for w in wanted):
-            if i + 1 < len(ls):
-                nxt = ls[i + 1]
-                # Не возвращаем следующий заголовок как значение.
-                if nxt:
-                    return nxt
+        for lab in labels_low:
+            if low == lab and i + 1 < len(ls):
+                return ls[i + 1]
+
+            if low.startswith(lab + " "):
+                rest = clean_text(line[len(lab):])
+                if rest:
+                    return rest
     return None
 
 
-def date_after_label(text, label_starts):
-    ls = lines_of(text)
-    wanted = [x.lower() for x in label_starts]
+def date_for_labels(text, labels):
+    """
+    Устойчивый поиск даты после подписи.
+    Поддерживает и:
+        КОНЕЦ ОБСУЖДЕНИЯ
+        17 сентября 2026 г., 10:00
+    и:
+        КОНЕЦ ОБСУЖДЕНИЯ 17 сентября 2026 г., 10:00
+    """
+    normalized = clean_text(text)
 
+    month_words = "|".join(map(re.escape, RU_MONTHS.keys()))
+    date_re = (
+        rf"(\d{{1,2}}\s+(?:{month_words})\s+\d{{4}}\s*г?\.?,?\s*"
+        rf"\d{{1,2}}:\d{{2}})"
+    )
+
+    for label in labels:
+        pattern = rf"{re.escape(label)}\s*[:\-]?\s*{date_re}"
+        m = re.search(pattern, normalized, re.I)
+        if m:
+            return parse_ru_datetime(m.group(1))
+
+    # Резерв: построчный поиск.
+    ls = lines_of(text)
     for i, line in enumerate(ls):
         low = line.lower()
-        if any(low.startswith(w) for w in wanted):
+        if any(low.startswith(label.lower()) for label in labels):
+            parsed = parse_ru_datetime(line)
+            if parsed:
+                return parsed
             for j in range(i + 1, min(i + 4, len(ls))):
                 parsed = parse_ru_datetime(ls[j])
                 if parsed:
@@ -372,57 +383,50 @@ def date_after_label(text, label_starts):
     return None
 
 
-def extract_parent_tender_id(driver):
-    candidates = []
-    xpaths = [
-        "//a[contains(normalize-space(.),'Перейти на закупку')]",
-        "//button[contains(normalize-space(.),'Перейти на закупку')]",
-        "//*[contains(normalize-space(.),'Перейти на закупку')]",
-    ]
+def extract_parent_tender_id_without_click(driver):
+    """
+    Не уходим со страницы лота.
+    Пытаемся извлечь номер закупки из атрибутов/HTML элемента
+    "Перейти на закупку".
+    """
+    try:
+        elems = driver.find_elements(
+            By.XPATH,
+            "//*[contains(normalize-space(.),'Перейти на закупку')]"
+        )
+    except Exception:
+        elems = []
 
-    for xp in xpaths:
+    for el in elems[:5]:
         try:
-            candidates.extend(driver.find_elements(By.XPATH, xp))
-        except Exception:
-            pass
-
-    # 1) Сначала пробуем извлечь номер без клика.
-    for el in candidates:
-        try:
-            pieces = [
+            parts = [
                 el.get_attribute("href"),
                 el.get_attribute("onclick"),
+                el.get_attribute("ng-click"),
+                el.get_attribute("ui-sref"),
                 el.get_attribute("outerHTML"),
             ]
-            blob = " ".join(clean_text(x) for x in pieces if x)
-            m = re.search(r"item/(\d{5,})/advert", blob)
-            if m:
-                return m.group(1)
-        except Exception:
-            pass
+            blob = " ".join(clean_text(x) for x in parts if x)
 
-    # 2) Если href нет — кликаем по ссылке и читаем route.
-    for el in candidates[:3]:
-        try:
-            driver.execute_script("arguments[0].click();", el)
-            WebDriverWait(driver, 8).until(
-                lambda d: "/advert" in (d.current_url or "")
-            )
-            m = re.search(r"item/(\d{5,})/advert", driver.current_url or "")
-            if m:
-                return m.group(1)
+            for pattern in [
+                r"item/(\d{5,})/advert",
+                r"advert[^0-9]{0,20}(\d{5,})",
+                r"(\d{5,})[^0-9]{0,20}advert",
+            ]:
+                m = re.search(pattern, blob, re.I)
+                if m:
+                    return m.group(1)
         except Exception:
             pass
 
     return None
 
 
-def extract_documents(driver):
+def extract_documents_metadata(driver):
     doc_count = 0
-    urls = []
     names = []
+    urls = []
 
-    controls = []
     try:
         controls = driver.find_elements(
             By.XPATH,
@@ -440,29 +444,19 @@ def extract_documents(driver):
         except Exception:
             pass
 
-    # Пробуем раскрыть меню документов.
-    for el in controls[:2]:
-        try:
-            driver.execute_script("arguments[0].click();", el)
-            time.sleep(0.5)
-        except Exception:
-            pass
-
+    # Не раскрываем список, если это может изменить состояние страницы.
+    # Считываем доступные ссылки/названия, если они уже присутствуют в DOM.
     try:
-        anchors = driver.find_elements(By.TAG_NAME, "a")
-        for a in anchors:
+        for a in driver.find_elements(By.TAG_NAME, "a"):
             try:
                 txt = clean_text(a.text)
                 href = clean_text(a.get_attribute("href"))
                 blob = f"{txt} {href}".lower()
-
                 if not href:
                     continue
-
                 if (
                     "документ" in blob
                     or "download" in blob
-                    or "file" in blob
                     or "attachment" in blob
                     or "spec" in blob
                 ):
@@ -482,37 +476,119 @@ def extract_documents(driver):
     return doc_count, urls, names, has_techspec
 
 
-def enrich_lot_detail(driver, row, save_sample=False):
-    """
-    Открывает карточку конкретного лота и добавляет детали.
-    Ошибка одной карточки не ломает весь сбор.
-    """
-    url = row["public_url"]
-    driver.get(url)
+def find_card_by_lot_id(driver, lot_id):
+    cards = driver.find_elements(By.CSS_SELECTOR, "div.m-sidebar__layout--found-item")
+    needle = str(lot_id)
 
-    wait = WebDriverWait(driver, WAIT_SECONDS)
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(1.2)
+    for card in cards:
+        try:
+            if re.search(rf"№\s*{re.escape(needle)}\b", card.text or ""):
+                return card
+        except Exception:
+            continue
+
+    return None
+
+
+def click_lot_card(driver, lot_id):
+    """
+    Открываем карточку именно кликом по найденному лоту.
+    Это ключевое отличие от нестабильного прямого перехода.
+    """
+    card = find_card_by_lot_id(driver, lot_id)
+    if card is None:
+        raise RuntimeError(f"Lot card {lot_id} not found on current search page")
+
+    attempts = []
+
+    # 1. Обычный click.
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});",
+            card,
+        )
+        time.sleep(0.15)
+        card.click()
+        attempts.append("native")
+    except Exception:
+        pass
+
+    def detail_is_open(d):
+        try:
+            url = d.current_url or ""
+            body = d.find_element(By.TAG_NAME, "body").text or ""
+            return (
+                f"/{lot_id}/lot" in url
+                and re.search(rf"№\s*{re.escape(str(lot_id))}\b", body) is not None
+            )
+        except Exception:
+            return False
+
+    try:
+        WebDriverWait(driver, 6).until(detail_is_open)
+        return
+    except Exception:
+        pass
+
+    # 2. JS click по карточке.
+    card = find_card_by_lot_id(driver, lot_id)
+    if card is not None:
+        try:
+            driver.execute_script("arguments[0].click();", card)
+            attempts.append("js")
+            WebDriverWait(driver, 8).until(detail_is_open)
+            return
+        except Exception:
+            pass
+
+    # 3. Иногда клик висит на заголовке внутри карточки.
+    card = find_card_by_lot_id(driver, lot_id)
+    if card is not None:
+        try:
+            candidates = card.find_elements(
+                By.CSS_SELECTOR,
+                "a, button, .m-found-item__title, .m-found-item__title--name"
+            )
+            for child in candidates:
+                try:
+                    driver.execute_script("arguments[0].click();", child)
+                    attempts.append("child-js")
+                    WebDriverWait(driver, 5).until(detail_is_open)
+                    return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        f"Could not open lot {lot_id} by click; attempts={attempts}; "
+        f"url={driver.current_url}"
+    )
+
+
+def enrich_from_open_detail(driver, row):
+    lot_id = row["source_lot_id"]
 
     body = driver.find_element(By.TAG_NAME, "body").text or ""
-
-    # Проверка, что мы действительно на ЛОТЕ.
     current_url = driver.current_url or ""
-    if f"/{row['source_lot_id']}/lot" not in current_url:
+
+    if f"/{lot_id}/lot" not in current_url:
         raise RuntimeError(
-            f"Samruk opened unexpected entity for lot {row['source_lot_id']}: "
-            f"{current_url}"
+            f"Opened entity is not lot {lot_id}: {current_url}"
         )
 
-    customer = value_after_label(body, ["ЗАКАЗЧИК"])
-    delivery_place = value_after_label(body, ["МЕСТО ПОСТАВКИ"])
-    procurement_place = value_after_label(body, ["МЕСТО ПРОВЕДЕНИЯ ЗАКУПОК"])
-    ens_tru = value_after_label(body, ["КОД ЕНС ТРУ"])
-    characteristic = value_after_label(body, ["КРАТКАЯ ХАРАКТЕРИСТИКА"])
-    quantity_text = value_after_label(body, ["КОЛИЧЕСТВО"])
-    unit = value_after_label(body, ["ЕД. ИЗМЕРЕНИЯ", "ЕДИНИЦА ИЗМЕРЕНИЯ"])
+    # После успешного клика это лучший URL для "Открыть оригинал".
+    row["public_url"] = current_url
 
-    started_at = date_after_label(
+    customer = label_value_from_lines(body, ["ЗАКАЗЧИК"])
+    delivery_place = label_value_from_lines(body, ["МЕСТО ПОСТАВКИ"])
+    procurement_place = label_value_from_lines(body, ["МЕСТО ПРОВЕДЕНИЯ ЗАКУПОК"])
+    ens_tru = label_value_from_lines(body, ["КОД ЕНС ТРУ"])
+    characteristic = label_value_from_lines(body, ["КРАТКАЯ ХАРАКТЕРИСТИКА"])
+    quantity_text = label_value_from_lines(body, ["КОЛИЧЕСТВО"])
+    unit = label_value_from_lines(body, ["ЕД. ИЗМЕРЕНИЯ", "ЕДИНИЦА ИЗМЕРЕНИЯ"])
+
+    started_at = date_for_labels(
         body,
         [
             "НАЧАЛО ОБСУЖДЕНИЯ",
@@ -520,7 +596,7 @@ def enrich_lot_detail(driver, row, save_sample=False):
             "НАЧАЛО ПРИЁМА ЗАЯВОК",
         ],
     )
-    expires_at = date_after_label(
+    expires_at = date_for_labels(
         body,
         [
             "КОНЕЦ ОБСУЖДЕНИЯ",
@@ -529,11 +605,8 @@ def enrich_lot_detail(driver, row, save_sample=False):
         ],
     )
 
-    # Документы читаем ДО клика "Перейти на закупку".
-    doc_count, doc_urls, doc_names, has_techspec = extract_documents(driver)
-
-    # "Перейти на закупку" дает родительский номер закупки.
-    parent_tender_id = extract_parent_tender_id(driver)
+    parent_tender_id = extract_parent_tender_id_without_click(driver)
+    doc_count, doc_urls, doc_names, has_techspec = extract_documents_metadata(driver)
 
     if customer:
         row["customer_name"] = customer
@@ -551,19 +624,26 @@ def enrich_lot_detail(driver, row, save_sample=False):
     if parent_tender_id:
         row["source_tender_id"] = parent_tender_id
 
-    detail_parts = [
+    if row.get("expires_at"):
+        try:
+            exp = datetime.fromisoformat(row["expires_at"])
+            now = datetime.now(exp.tzinfo or timezone.utc)
+            row["is_active"] = exp > now
+        except Exception:
+            row["is_active"] = True
+
+    parts = [
         row.get("description"),
         characteristic,
         f"Место поставки: {delivery_place}" if delivery_place else None,
         f"Код ЕНС ТРУ: {ens_tru}" if ens_tru else None,
     ]
-    row["description"] = clean_text(
-        " | ".join(x for x in detail_parts if x)
-    )
+    row["description"] = clean_text(" | ".join(x for x in parts if x))
 
     row["raw"].update({
         "detail_checked": True,
-        "detail_url": url,
+        "detail_open_method": "click",
+        "detail_url": current_url,
         "parent_tender_id": parent_tender_id,
         "delivery_place": delivery_place,
         "procurement_place": procurement_place,
@@ -577,86 +657,46 @@ def enrich_lot_detail(driver, row, save_sample=False):
         "has_techspec": bool(has_techspec),
     })
 
-    if save_sample:
-        try:
-            driver.save_screenshot(str(OUT / "samruk_lot_sample.png"))
-        except Exception:
-            pass
-
     return row
 
 
-def collect_list_rows(driver):
-    all_rows = {}
-    seen_page_signatures = set()
+def return_to_search(driver, keyword, page):
+    target = lot_search_url(keyword, page)
 
-    for keyword in KEYWORDS:
-        print("")
-        print("SEARCH LOTS:", keyword)
+    # Сначала пытаемся вернуться назад — это быстрее.
+    try:
+        driver.back()
+        WebDriverWait(driver, 8).until(
+            lambda d: "/lot" not in (d.current_url or "")
+        )
+        cards = wait_for_cards(driver, timeout=8)
+        if cards:
+            return
+    except Exception:
+        pass
 
-        for page in range(1, MAX_PAGES_PER_KEYWORD + 1):
-            url = lot_search_url(keyword, page)
-            print("  PAGE:", page, url)
-
-            driver.get(url)
-            WebDriverWait(driver, WAIT_SECONDS).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-            time.sleep(1.2)
-
-            cards = wait_for_cards(driver)
-            print("  CARDS:", len(cards))
-
-            if not cards:
-                break
-
-            page_ids = []
-            new_on_page = 0
-
-            for card in cards:
-                row = parse_list_card(card, keyword, page)
-                if not row:
-                    continue
-
-                lot_id = row["source_lot_id"]
-                page_ids.append(lot_id)
-
-                # Берем только товары нужного профиля.
-                if row["raw"]["is_service"]:
-                    print("    SKIP SERVICE:", lot_id, row["title"])
-                    continue
-
-                if not row["raw"]["is_relevant_goods"]:
-                    print("    SKIP IRRELEVANT:", lot_id, row["title"])
-                    continue
-
-                if lot_id not in all_rows:
-                    all_rows[lot_id] = row
-                    new_on_page += 1
-                    print("    LOT:", lot_id, "|", row["title"])
-                else:
-                    # Если тот же лот встретился по другому ключевому слову,
-                    # сохраняем список совпавших поисковых фраз.
-                    raw = all_rows[lot_id]["raw"]
-                    matched = raw.setdefault("matched_keywords", [])
-                    if keyword not in matched:
-                        matched.append(keyword)
-
-            signature = tuple(page_ids)
-
-            if signature in seen_page_signatures:
-                print("  STOP: repeated page signature")
-                break
-            seen_page_signatures.add(signature)
-
-            if new_on_page == 0 and page > 1:
-                print("  STOP: no new relevant lots")
-                break
-
-    return list(all_rows.values())
+    # Надёжный резерв.
+    driver.get(target)
+    wait_for_cards(driver, timeout=WAIT_SECONDS)
 
 
-def save_results(all_rows, goods_rows):
+def save_results(all_rows):
+    # Финальная защита: только товары и только lot-level.
+    goods_rows = []
+
+    for row in all_rows:
+        lot_id = clean_text(row.get("source_lot_id"))
+        url = clean_text(row.get("public_url"))
+        blob = f"{row.get('title','')} {row.get('description','')}"
+
+        if not lot_id:
+            continue
+        if "/lot" not in url:
+            continue
+        if is_service(blob):
+            continue
+        goods_rows.append(row)
+
     all_json = OUT / "samruk_all_results.json"
     json_path = OUT / "samruk_tenders.json"
     csv_path = OUT / "samruk_tenders.csv"
@@ -665,7 +705,6 @@ def save_results(all_rows, goods_rows):
         json.dumps(all_rows, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
     json_path.write_text(
         json.dumps(goods_rows, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -693,21 +732,156 @@ def save_results(all_rows, goods_rows):
         for row in goods_rows:
             writer.writerow({k: row.get(k) for k in fields})
 
-    return all_json, json_path, csv_path
+    return goods_rows, all_json, json_path, csv_path
+
+
+def collect(driver):
+    rows_by_id = {}
+
+    for keyword in KEYWORDS:
+        print("")
+        print("SEARCH LOTS:", keyword)
+        seen_signatures = set()
+
+        for page in range(1, MAX_PAGES_PER_KEYWORD + 1):
+            search_url = lot_search_url(keyword, page)
+            print("  PAGE:", page, search_url)
+
+            driver.get(search_url)
+            WebDriverWait(driver, WAIT_SECONDS).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+
+            cards = wait_for_cards(driver)
+            print("  CARDS:", len(cards))
+
+            if not cards:
+                break
+
+            page_ids = []
+            new_on_page = 0
+
+            # Сначала снимаем список карточек без кликов.
+            parsed_page_rows = []
+            for card in cards:
+                row = parse_list_card(card, keyword, page)
+                if not row:
+                    continue
+
+                lot_id = row["source_lot_id"]
+                page_ids.append(lot_id)
+
+                if row["raw"]["is_service"]:
+                    print("    SKIP SERVICE:", lot_id, row["title"])
+                    continue
+
+                if not row["raw"]["is_relevant_goods"]:
+                    print("    SKIP IRRELEVANT:", lot_id, row["title"])
+                    continue
+
+                if lot_id not in rows_by_id:
+                    rows_by_id[lot_id] = row
+                    parsed_page_rows.append(row)
+                    new_on_page += 1
+                    print("    LOT:", lot_id, "|", row["title"])
+                else:
+                    raw = rows_by_id[lot_id]["raw"]
+                    matched = raw.setdefault("matched_keywords", [])
+                    if keyword not in matched:
+                        matched.append(keyword)
+
+            # Сразу сохраняем список, чтобы не потерять его при сбое детали.
+            save_results(list(rows_by_id.values()))
+
+            signature = tuple(page_ids)
+            if signature in seen_signatures:
+                print("  STOP: repeated page signature")
+                break
+            seen_signatures.add(signature)
+
+            if new_on_page == 0 and page > 1:
+                print("  STOP: no new relevant lots")
+                break
+
+    return list(rows_by_id.values())
+
+
+def enrich_rows(driver, rows):
+    if DETAIL_LIMIT > 0:
+        targets = rows[:DETAIL_LIMIT]
+    else:
+        targets = rows
+
+    print("")
+    print("DETAIL TARGETS:", len(targets), "/", len(rows))
+
+    for idx, row in enumerate(targets, 1):
+        lot_id = row["source_lot_id"]
+        keyword = row["raw"].get("keyword") or "картридж"
+        page = int(row["raw"].get("page") or 1)
+        search_url = lot_search_url(keyword, page)
+
+        try:
+            # На всякий случай возвращаемся на нужную страницу поиска.
+            if (
+                f"page={page}" not in (driver.current_url or "")
+                or "tabs=lot" not in (driver.current_url or "")
+                or "/lot" in (driver.current_url or "")
+            ):
+                driver.get(search_url)
+                wait_for_cards(driver)
+
+            print(f"DETAIL {idx}/{len(targets)}: LOT {lot_id}")
+
+            click_lot_card(driver, lot_id)
+            enrich_from_open_detail(driver, row)
+
+            print(
+                "  OK | tender:",
+                row.get("source_tender_id"),
+                "| customer:",
+                row.get("customer_name"),
+                "| expires:",
+                row.get("expires_at"),
+            )
+
+        except Exception as e:
+            row["raw"]["detail_checked"] = False
+            row["raw"]["detail_open_method"] = "click"
+            row["raw"]["detail_error"] = repr(e)
+            print("  WARNING detail failed:", lot_id, repr(e))
+
+        finally:
+            # Сохраняем прогресс после каждой карточки.
+            save_results(rows)
+
+            try:
+                if "/lot" in (driver.current_url or ""):
+                    return_to_search(driver, keyword, page)
+            except Exception:
+                pass
+
+    # Строки вне тестового лимита не считаем ошибкой.
+    if DETAIL_LIMIT > 0:
+        for row in rows[len(targets):]:
+            row["raw"]["detail_checked"] = False
+            row["raw"]["detail_error"] = "DETAIL_LIMIT reached (test mode)"
+
+    return rows
 
 
 def main():
-    print("=" * 76)
+    print("=" * 78)
     print("TENDER RADAR KZ - SAMRUK LOT COLLECTOR")
     print("ENTITY LEVEL: LOT")
+    print("DETAIL OPEN METHOD: CLICK FOUND LOT CARD")
     print("MODE: READ ONLY, NO SUPABASE WRITE")
-    print("=" * 76)
+    print("=" * 78)
 
-    list_driver = make_driver()
-    detail_driver = None
+    driver = make_driver()
 
     try:
-        rows = collect_list_rows(list_driver)
+        rows = collect(driver)
 
         if not rows:
             raise RuntimeError("No relevant Samruk LOT rows were extracted")
@@ -715,70 +889,22 @@ def main():
         print("")
         print("RELEVANT UNIQUE LOTS:", len(rows))
 
-        # Обогащение деталей.
-        detail_driver = make_driver()
-        detail_count = min(len(rows), DETAIL_LIMIT)
+        rows = enrich_rows(driver, rows)
 
-        for idx, row in enumerate(rows[:detail_count], 1):
-            lot_id = row["source_lot_id"]
-            try:
-                print(
-                    f"DETAIL {idx}/{detail_count}: LOT {lot_id}"
-                )
-                enrich_lot_detail(
-                    detail_driver,
-                    row,
-                    save_sample=(idx == 1),
-                )
-                print(
-                    "  OK | tender:",
-                    row.get("source_tender_id"),
-                    "| customer:",
-                    row.get("customer_name"),
-                    "| expires:",
-                    row.get("expires_at"),
-                )
-            except Exception as e:
-                row["raw"]["detail_checked"] = False
-                row["raw"]["detail_error"] = repr(e)
-                print("  WARNING detail failed:", lot_id, repr(e))
-
-        # Если деталей больше лимита, строки все равно остаются валидными:
-        # номер лота, название, сумма, срок и прямая ссылка уже есть из списка.
-        for row in rows[detail_count:]:
-            row["raw"]["detail_checked"] = False
-            row["raw"]["detail_error"] = "DETAIL_LIMIT reached"
-
-        # Финальная защита: только лоты и только товары.
-        goods_rows = []
-        for row in rows:
-            lot_id = clean_text(row.get("source_lot_id"))
-            url = clean_text(row.get("public_url"))
-            blob = f"{row.get('title','')} {row.get('description','')}"
-
-            if not lot_id:
-                continue
-            if f"/{lot_id}/lot" not in url:
-                continue
-            if is_service(blob):
-                continue
-
-            goods_rows.append(row)
-
-        all_json, json_path, csv_path = save_results(rows, goods_rows)
+        goods_rows, all_json, json_path, csv_path = save_results(rows)
 
         print("")
         print("ALL RELEVANT LOTS:", len(rows))
         print("GOODS SAVED:", len(goods_rows))
-        print("DETAILS CHECKED:", detail_count)
+        print("DETAILS TARGETED:", len(rows) if DETAIL_LIMIT <= 0 else min(DETAIL_LIMIT, len(rows)))
+        print("DETAILS OK:", sum(r.get("raw", {}).get("detail_checked") is True for r in rows))
+        print("WITH EXPIRES_AT:", sum(bool(r.get("expires_at")) for r in rows))
+        print("WITH CUSTOMER:", sum(bool(r.get("customer_name")) for r in rows))
+        print("WITH PARENT TENDER:", sum(bool(r.get("source_tender_id")) for r in rows))
         print("ALL JSON:", all_json)
         print("JSON:", json_path)
         print("CSV :", csv_path)
 
-        if not goods_rows:
-            raise RuntimeError("Final Samruk LOT dataset is empty")
-
-        # Контрольная проверка архитектуры.
         bad = [
             r for r in goods_rows
             if "/lot" not in clean_text(r.get("public_url"))
@@ -789,19 +915,17 @@ def main():
                 f"Architecture check failed: {len(bad)} rows are not LOT-level"
             )
 
+        if not goods_rows:
+            raise RuntimeError("Final Samruk LOT dataset is empty")
+
         print("")
         print("SUCCESS: Samruk LOT-level collection completed")
 
     finally:
         try:
-            list_driver.quit()
+            driver.quit()
         except Exception:
             pass
-        if detail_driver is not None:
-            try:
-                detail_driver.quit()
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":
