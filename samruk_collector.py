@@ -130,7 +130,7 @@ def parse_ru_datetime(text):
     s = clean_text(text).lower()
 
     m = re.search(
-        r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})\s*г?\.?,?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?",
+        r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})\s*г?\.?,?\s*(?:в\s*)?(\d{1,2}):(\d{2})(?::(\d{2}))?",
         s,
         re.I,
     )
@@ -529,9 +529,7 @@ def label_value_from_lines(text, labels):
 
 def date_for_labels(text, labels):
     """
-    Ищет ближайшую дату около нужной подписи Samruk.
-    SPA может вставлять между подписью и датой несколько служебных строк,
-    поэтому смотрим расширенное окно, а не только 4 строки.
+    Ищет дату в той же строке, на следующих строках и в нормализованном тексте.
     """
     raw_lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
 
@@ -540,33 +538,20 @@ def date_for_labels(text, labels):
         for label in labels:
             lab = clean_text(label).lower()
             if lab in low:
-                # 1) дата может быть в той же строке
                 parsed = parse_ru_datetime(line)
                 if parsed:
                     return parsed
 
-                # 2) или в следующих строках DOM; берём ближайшую дату
-                for j in range(i + 1, min(i + 16, len(raw_lines))):
+                for j in range(i + 1, min(i + 5, len(raw_lines))):
                     parsed = parse_ru_datetime(raw_lines[j])
                     if parsed:
                         return parsed
 
-                # 3) иногда дата попадает перед подписью в DOM-порядке
-                for j in range(i - 1, max(-1, i - 6), -1):
-                    parsed = parse_ru_datetime(raw_lines[j])
-                    if parsed:
-                        return parsed
-
-    # Последний резерв: большое нормализованное окно вокруг подписи.
     normalized = clean_text(text)
-    low_norm = normalized.lower()
     for label in labels:
-        lab = clean_text(label).lower()
-        pos = low_norm.find(lab)
+        pos = normalized.lower().find(clean_text(label).lower())
         if pos >= 0:
-            left = max(0, pos - 180)
-            right = min(len(normalized), pos + 700)
-            window = normalized[left:right]
+            window = normalized[pos:pos + 220]
             parsed = parse_ru_datetime(window)
             if parsed:
                 return parsed
@@ -586,7 +571,7 @@ def wait_for_detail_text(driver, lot_id, timeout=WAIT_SECONDS):
             body = d.execute_script("return document.body ? document.body.innerText : ''") or ""
             if f"/{lot_id}/lot" not in url:
                 return False
-            if re.search(rf"№\s*{re.escape(lot_id)}\b", body) is None:
+            if re.search(rf"№\\s*{re.escape(lot_id)}\\b", body) is None:
                 return False
             markers = (
                 "ЗАКАЗЧИК",
@@ -620,14 +605,8 @@ def extract_parent_tender_id_by_click(driver):
     try:
         elems = driver.find_elements(
             By.XPATH,
-            "//a[contains(normalize-space(.),'Перейти на закупку')] | "
-            "//button[contains(normalize-space(.),'Перейти на закупку')]"
+            "//*[contains(normalize-space(.),'Перейти на закупку')]"
         )
-        if not elems:
-            elems = driver.find_elements(
-                By.XPATH,
-                "//*[normalize-space(.)='Перейти на закупку']"
-            )
     except Exception:
         elems = []
 
@@ -663,7 +642,14 @@ def extract_parent_tender_id_by_click(driver):
 
     for el in elems[:3]:
         try:
-            driver.execute_script("arguments[0].click();", el)
+            try:
+                el.click()
+            except Exception:
+                driver.execute_script(
+                    "arguments[0].dispatchEvent(new MouseEvent('click', "
+                    "{view:window,bubbles:true,cancelable:true}));",
+                    el,
+                )
 
             def advert_opened(d):
                 try:
@@ -673,7 +659,7 @@ def extract_parent_tender_id_by_click(driver):
                 except Exception:
                     return False
 
-            WebDriverWait(driver, 7).until(advert_opened)
+            WebDriverWait(driver, 12).until(advert_opened)
 
             opened_new_tab = False
             original_handle = before_handles[0] if before_handles else None
@@ -971,14 +957,16 @@ def enrich_from_open_detail(driver, row):
     ]
     row["description"] = clean_text(" | ".join(x for x in parts if x))
 
-    body_lines = [clean_text(line) for line in str(body or "").splitlines() if clean_text(line)]
-    diagnostic_lines = []
-    for i, line in enumerate(body_lines):
+    diagnostic_lines = [
+        clean_text(line)
+        for line in str(body or "").splitlines()
         if any(marker in line.upper() for marker in (
-            "НАЧАЛО", "КОНЕЦ", "ЗАКАЗЧИК", "ПЕРЕЙТИ НА ЗАКУПКУ"
-        )):
-            diagnostic_lines.extend(body_lines[i:min(i + 5, len(body_lines))])
-    diagnostic_lines = diagnostic_lines[:40]
+            "НАЧАЛО",
+            "КОНЕЦ",
+            "ЗАКАЗЧИК",
+            "ПЕРЕЙТИ НА ЗАКУПКУ",
+        ))
+    ][:30]
 
     row["raw"].update({
         "detail_checked": True,
