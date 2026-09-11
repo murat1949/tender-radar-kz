@@ -5,6 +5,7 @@ import sys
 import json
 import subprocess
 import time
+from datetime import datetime, timezone
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -120,9 +121,27 @@ def make_samruk():
     for r in rows:
         if not isinstance(r, dict):
             continue
+
         lot_id = str(r.get("source_lot_id") or "").strip()
         if not lot_id:
             continue
+
+        raw = r.get("raw") if isinstance(r.get("raw"), dict) else {}
+        remaining = str(raw.get("remaining_text") or "").strip()
+        expires_at = nempty(r.get("expires_at"))
+
+        # В Samruk актуальная карточка в поиске обычно содержит "Осталось: ...".
+        # Если этого поля нет, используем точную дату окончания, когда она известна.
+        is_active = bool(remaining)
+
+        if not is_active and expires_at:
+            try:
+                exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                is_active = exp > datetime.now(exp.tzinfo)
+            except Exception:
+                is_active = False
 
         out.append({
             "source_code": "samruk",
@@ -144,9 +163,9 @@ def make_samruk():
             "category": nempty(r.get("category")),
             "published_at": nempty(r.get("published_at")),
             "started_at": nempty(r.get("started_at")),
-            "expires_at": nempty(r.get("expires_at")),
-            "is_active": bool(r.get("is_active", True)),
-            "raw": r.get("raw") if isinstance(r.get("raw"), dict) else r,
+            "expires_at": expires_at,
+            "is_active": is_active,
+            "raw": raw if raw else r,
         })
 
     return out
@@ -219,6 +238,40 @@ def make_goszakup():
         })
 
     return out
+
+
+
+def deactivate_existing_source(cfg, source):
+    """
+    Историю не удаляем. Перед успешной загрузкой свежего набора
+    помечаем прежние активные строки источника как неактивные.
+    Это убирает старые Samruk-записи из рабочего экрана.
+    """
+    endpoint = (
+        cfg["SUPABASE_URL"].rstrip("/")
+        + "/rest/v1/tenders?source_code=eq."
+        + source
+        + "&is_active=eq.true"
+    )
+    key = cfg["SUPABASE_SERVICE_ROLE_KEY"]
+
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps({"is_active": False}).encode("utf-8"),
+        headers={
+            "apikey": key,
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        method="PATCH",
+    )
+
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        resp.read()
+
+    print("STALE", source, ": previous active rows -> inactive")
+
 
 
 def upload_rows(cfg, source, rows):
@@ -297,7 +350,7 @@ def update_source(cfg, source, ok=True, err=None):
 
 def main():
     print("=" * 70)
-    print("TENDER RADAR KZ - CLOUD AUTO COLLECT - LOT ARCHITECTURE")
+    print("TENDER RADAR KZ - CLOUD AUTO COLLECT - LOT ARCHITECTURE + STALE CLEANUP")
     print("SOURCES: SAMRUK + GOSZAKUP")
     print("MITWORK: DISABLED")
     print("=" * 70)
@@ -327,7 +380,21 @@ def main():
         )
         rows = make_samruk()
         validate_samruk_lots(rows)
+
+        active_rows = sum(1 for r in rows if r.get("is_active") is True)
         print("Prepared for Supabase:", len(rows))
+        print("Samruk current active lots:", active_rows)
+
+        if not rows:
+            raise RuntimeError("Samruk returned 0 rows - old data left untouched")
+        if active_rows == 0:
+            raise RuntimeError(
+                "Samruk returned 0 current active lots - old data left untouched"
+            )
+
+        # Без удаления истории: старые активные строки гасим,
+        # затем свежие лоты upsert-им обратно с актуальным is_active.
+        deactivate_existing_source(cfg, "samruk")
         totals["samruk"] = upload_rows(cfg, "samruk", rows)
         update_source(cfg, "samruk", True)
 
