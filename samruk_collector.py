@@ -122,28 +122,49 @@ def number_to_float(value):
 
 
 def parse_ru_datetime(text):
+    """
+    Понимает оба формата, которые встречаются в Samruk:
+      17 сентября 2026 г., 10:00
+      17.09.2026 10:00:00
+    """
     s = clean_text(text).lower()
+
     m = re.search(
-        r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})\s*г?\.?,?\s*(\d{1,2}):(\d{2})",
+        r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})\s*г?\.?,?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?",
         s,
         re.I,
     )
-    if not m:
-        return None
+    if m:
+        month = RU_MONTHS.get(m.group(2))
+        if month:
+            dt = datetime(
+                int(m.group(3)),
+                month,
+                int(m.group(1)),
+                int(m.group(4)),
+                int(m.group(5)),
+                int(m.group(6) or 0),
+                tzinfo=KZ_TZ,
+            )
+            return dt.isoformat()
 
-    month = RU_MONTHS.get(m.group(2))
-    if not month:
-        return None
-
-    dt = datetime(
-        int(m.group(3)),
-        month,
-        int(m.group(1)),
-        int(m.group(4)),
-        int(m.group(5)),
-        tzinfo=KZ_TZ,
+    m = re.search(
+        r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?",
+        s,
     )
-    return dt.isoformat()
+    if m:
+        dt = datetime(
+            int(m.group(3)),
+            int(m.group(2)),
+            int(m.group(1)),
+            int(m.group(4)),
+            int(m.group(5)),
+            int(m.group(6) or 0),
+            tzinfo=KZ_TZ,
+        )
+        return dt.isoformat()
+
+    return None
 
 
 def remaining_to_expires_at(text):
@@ -508,41 +529,175 @@ def label_value_from_lines(text, labels):
 
 def date_for_labels(text, labels):
     """
-    Устойчивый поиск даты после подписи.
-    Поддерживает и:
-        КОНЕЦ ОБСУЖДЕНИЯ
-        17 сентября 2026 г., 10:00
-    и:
-        КОНЕЦ ОБСУЖДЕНИЯ 17 сентября 2026 г., 10:00
+    Ищет дату в той же строке, на следующих строках и в нормализованном тексте.
     """
-    normalized = clean_text(text)
+    raw_lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
 
-    month_words = "|".join(map(re.escape, RU_MONTHS.keys()))
-    date_re = (
-        rf"(\d{{1,2}}\s+(?:{month_words})\s+\d{{4}}\s*г?\.?,?\s*"
-        rf"\d{{1,2}}:\d{{2}})"
-    )
-
-    for label in labels:
-        pattern = rf"{re.escape(label)}\s*[:\-]?\s*{date_re}"
-        m = re.search(pattern, normalized, re.I)
-        if m:
-            return parse_ru_datetime(m.group(1))
-
-    # Резерв: построчный поиск.
-    ls = lines_of(text)
-    for i, line in enumerate(ls):
-        low = line.lower()
-        if any(low.startswith(label.lower()) for label in labels):
-            parsed = parse_ru_datetime(line)
-            if parsed:
-                return parsed
-            for j in range(i + 1, min(i + 4, len(ls))):
-                parsed = parse_ru_datetime(ls[j])
+    for i, line in enumerate(raw_lines):
+        low = clean_text(line).lower()
+        for label in labels:
+            lab = clean_text(label).lower()
+            if lab in low:
+                parsed = parse_ru_datetime(line)
                 if parsed:
                     return parsed
+
+                for j in range(i + 1, min(i + 5, len(raw_lines))):
+                    parsed = parse_ru_datetime(raw_lines[j])
+                    if parsed:
+                        return parsed
+
+    normalized = clean_text(text)
+    for label in labels:
+        pos = normalized.lower().find(clean_text(label).lower())
+        if pos >= 0:
+            window = normalized[pos:pos + 220]
+            parsed = parse_ru_datetime(window)
+            if parsed:
+                return parsed
+
     return None
 
+
+def wait_for_detail_text(driver, lot_id, timeout=WAIT_SECONDS):
+    """
+    Ждём, пока SPA Samruk реально дорисует содержимое карточки лота.
+    """
+    lot_id = str(lot_id)
+
+    def ready(d):
+        try:
+            url = d.current_url or ""
+            body = d.execute_script("return document.body ? document.body.innerText : ''") or ""
+            if f"/{lot_id}/lot" not in url:
+                return False
+            if re.search(rf"№\\s*{re.escape(lot_id)}\\b", body) is None:
+                return False
+            markers = (
+                "ЗАКАЗЧИК",
+                "МЕСТО ПОСТАВКИ",
+                "КОД ЕНС ТРУ",
+                "НАЧАЛО ОБСУЖДЕНИЯ",
+                "НАЧАЛО ПРИЕМА ЗАЯВОК",
+                "НАЧАЛО ПРИЁМА ЗАЯВОК",
+            )
+            return any(marker in body for marker in markers)
+        except Exception:
+            return False
+
+    try:
+        WebDriverWait(driver, min(timeout, 12)).until(ready)
+    except Exception:
+        pass
+
+    time.sleep(0.35)
+    return driver.execute_script(
+        "return document.body ? document.body.innerText : ''"
+    ) or ""
+
+
+def extract_parent_tender_id_by_click(driver):
+    """
+    Сначала пробуем прочитать номер закупки из HTML.
+    Если его там нет, кликаем "Перейти на закупку" и читаем номер из route.
+    Возвращаем (tender_id, tender_url, diagnostic_html).
+    """
+    try:
+        elems = driver.find_elements(
+            By.XPATH,
+            "//*[contains(normalize-space(.),'Перейти на закупку')]"
+        )
+    except Exception:
+        elems = []
+
+    diagnostics = []
+
+    for el in elems[:5]:
+        try:
+            html = clean_text(el.get_attribute("outerHTML"))
+            diagnostics.append(html[:1200])
+
+            parts = [
+                el.get_attribute("href"),
+                el.get_attribute("onclick"),
+                el.get_attribute("ng-click"),
+                el.get_attribute("ui-sref"),
+                html,
+            ]
+            blob = " ".join(clean_text(x) for x in parts if x)
+
+            for pattern in [
+                r"item/(\\d{5,})/advert",
+                r"advert[^0-9]{0,30}(\\d{5,})",
+                r"(\\d{5,})[^0-9]{0,30}advert",
+            ]:
+                m = re.search(pattern, blob, re.I)
+                if m:
+                    return m.group(1), None, diagnostics
+        except Exception:
+            pass
+
+    before_handles = list(driver.window_handles)
+    before_url = driver.current_url or ""
+
+    for el in elems[:3]:
+        try:
+            driver.execute_script("arguments[0].click();", el)
+
+            def advert_opened(d):
+                try:
+                    if len(d.window_handles) > len(before_handles):
+                        return True
+                    return "/advert" in (d.current_url or "")
+                except Exception:
+                    return False
+
+            WebDriverWait(driver, 7).until(advert_opened)
+
+            opened_new_tab = False
+            original_handle = before_handles[0] if before_handles else None
+            if len(driver.window_handles) > len(before_handles):
+                new_handles = [h for h in driver.window_handles if h not in before_handles]
+                if new_handles:
+                    driver.switch_to.window(new_handles[-1])
+                    opened_new_tab = True
+
+            tender_url = driver.current_url or ""
+            tender_id = None
+            for pattern in [
+                r"item/(\\d{5,})/advert",
+                r"[?&]q=(\\d{5,})",
+            ]:
+                m = re.search(pattern, tender_url, re.I)
+                if m:
+                    tender_id = m.group(1)
+                    break
+
+            if opened_new_tab:
+                try:
+                    driver.close()
+                except Exception:
+                    pass
+                try:
+                    if original_handle:
+                        driver.switch_to.window(original_handle)
+                except Exception:
+                    pass
+
+            return tender_id, tender_url, diagnostics
+
+        except Exception:
+            # Если SPA не отреагировала, пробуем следующий элемент.
+            try:
+                if len(driver.window_handles) > len(before_handles):
+                    new_handles = [h for h in driver.window_handles if h not in before_handles]
+                    if new_handles:
+                        driver.switch_to.window(new_handles[-1])
+            except Exception:
+                pass
+            continue
+
+    return None, before_url, diagnostics
 
 def extract_parent_tender_id_without_click(driver):
     """
@@ -721,15 +876,15 @@ def click_lot_card(driver, lot_id):
 def enrich_from_open_detail(driver, row):
     lot_id = row["source_lot_id"]
 
-    body = driver.find_element(By.TAG_NAME, "body").text or ""
     current_url = driver.current_url or ""
-
     if f"/{lot_id}/lot" not in current_url:
         raise RuntimeError(
             f"Opened entity is not lot {lot_id}: {current_url}"
         )
 
-    # После успешного клика это лучший URL для "Открыть оригинал".
+    # Ждём полной дорисовки карточки и только потом читаем поля.
+    body = wait_for_detail_text(driver, lot_id)
+    current_url = driver.current_url or ""
     row["public_url"] = current_url
 
     customer = label_value_from_lines(body, ["ЗАКАЗЧИК"])
@@ -757,8 +912,11 @@ def enrich_from_open_detail(driver, row):
         ],
     )
 
-    parent_tender_id = extract_parent_tender_id_without_click(driver)
     doc_count, doc_urls, doc_names, has_techspec = extract_documents_metadata(driver)
+
+    # Родительскую закупку получаем в самом конце:
+    # переход на неё уже не мешает чтению полей лота.
+    parent_tender_id, parent_tender_url, parent_diag = extract_parent_tender_id_by_click(driver)
 
     if customer:
         row["customer_name"] = customer
@@ -792,11 +950,24 @@ def enrich_from_open_detail(driver, row):
     ]
     row["description"] = clean_text(" | ".join(x for x in parts if x))
 
+    diagnostic_lines = [
+        clean_text(line)
+        for line in str(body or "").splitlines()
+        if any(marker in line.upper() for marker in (
+            "НАЧАЛО",
+            "КОНЕЦ",
+            "ЗАКАЗЧИК",
+            "ПЕРЕЙТИ НА ЗАКУПКУ",
+        ))
+    ][:30]
+
     row["raw"].update({
         "detail_checked": True,
         "detail_open_method": "click",
         "detail_url": current_url,
         "parent_tender_id": parent_tender_id,
+        "parent_tender_url": parent_tender_url,
+        "parent_link_html": parent_diag,
         "delivery_place": delivery_place,
         "procurement_place": procurement_place,
         "ens_tru": ens_tru,
@@ -807,10 +978,10 @@ def enrich_from_open_detail(driver, row):
         "document_names": doc_names,
         "has_documents": bool(doc_count or doc_urls),
         "has_techspec": bool(has_techspec),
+        "detail_diagnostic_lines": diagnostic_lines,
     })
 
     return row
-
 
 def return_to_search(driver, keyword, page):
     target = lot_search_url(keyword, page)
@@ -1039,7 +1210,7 @@ def main():
     print("=" * 78)
     print("TENDER RADAR KZ - SAMRUK LOT COLLECTOR")
     print("ENTITY LEVEL: LOT")
-    print("DETAIL OPEN METHOD: FRESH DOM CLICK (NO STALE ELEMENTS)")
+    print("DETAIL OPEN METHOD: CLICK + WAIT FULL DETAIL + PARENT TENDER CLICK")
     print("MODE: READ ONLY, NO SUPABASE WRITE")
     print("=" * 78)
 
