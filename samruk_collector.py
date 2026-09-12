@@ -971,6 +971,52 @@ def find_card_by_lot_id(driver, lot_id):
     return None
 
 
+
+def wait_for_target_lot_card(driver, lot_id, timeout=WAIT_SECONDS):
+    lot_id = str(lot_id)
+
+    def found(d):
+        try:
+            cards = d.find_elements(
+                By.CSS_SELECTOR,
+                "div.m-sidebar__layout--found-item",
+            )
+            needle = re.compile(rf"№\s*{re.escape(lot_id)}\b")
+            return any(needle.search(c.text or "") for c in cards)
+        except Exception:
+            return False
+
+    WebDriverWait(driver, timeout).until(found)
+    return True
+
+
+def open_fresh_search_page_for_lot(driver, keyword, page, lot_id):
+    """
+    Перед КАЖДОЙ детализацией заново открываем нужную страницу поиска
+    и ждём именно целевой lot_id. Это устраняет проблему Samruk SPA,
+    когда URL уже page=10, а DOM ещё содержит карточки другой страницы.
+    """
+    target = lot_search_url(keyword, page)
+
+    for attempt in range(1, 4):
+        driver.get(target)
+        try:
+            wait_for_target_lot_card(driver, lot_id, timeout=10)
+            return
+        except Exception:
+            if attempt < 3:
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+                time.sleep(1.2)
+
+    raise RuntimeError(
+        f"Target lot {lot_id} not present on fresh search page {page}; "
+        f"url={driver.current_url}"
+    )
+
+
 def click_lot_card(driver, lot_id):
     """
     Открывает конкретный найденный лот одним JavaScript-действием.
@@ -1340,13 +1386,14 @@ def enrich_rows(driver, rows):
         search_url = lot_search_url(keyword, page)
 
         try:
-            if (
-                f"page={page}" not in (driver.current_url or "")
-                or "tabs=lot" not in (driver.current_url or "")
-                or "/lot" in (driver.current_url or "")
-            ):
-                driver.get(search_url)
-                wait_for_cards(driver)
+            # Samruk — SPA. Перед каждым лотом грузим нужную страницу заново
+            # и ждём именно целевой lot_id, а не просто "какие-то 10 карточек".
+            open_fresh_search_page_for_lot(
+                driver,
+                keyword,
+                page,
+                lot_id,
+            )
 
             print(f"DETAIL {idx}/{len(targets)}: LOT {lot_id}")
 
@@ -1370,13 +1417,10 @@ def enrich_rows(driver, rows):
             print("  WARNING detail failed:", lot_id, repr(e))
 
         finally:
+            # Результат сохраняем после каждого лота.
+            # Назад в список не возвращаемся: следующий лот всегда
+            # открывается с чистой загрузки своей страницы поиска.
             save_results(rows)
-
-            try:
-                if "/lot" in (driver.current_url or ""):
-                    return_to_search(driver, keyword, page)
-            except Exception:
-                pass
 
     # Все лоты без "Осталось" сейчас считаем неактивными.
     active_ids = {str(r.get("source_lot_id")) for r in active_targets}
@@ -1400,7 +1444,7 @@ def main():
     print("=" * 78)
     print("TENDER RADAR KZ - SAMRUK LOT COLLECTOR")
     print("ENTITY LEVEL: LOT")
-    print("DETAIL MODE: ALL CURRENT ACTIVE LOTS + EXACT DEADLINE + TECHSPEC")
+    print("DETAIL MODE: FRESH PAGE PER ACTIVE LOT + EXACT DEADLINE + TECHSPEC")
     print("MODE: READ ONLY, NO SUPABASE WRITE")
     print("=" * 78)
 
