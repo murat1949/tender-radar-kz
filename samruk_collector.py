@@ -381,7 +381,7 @@ def parse_list_snapshot(item, keyword, page):
         "published_at": None,
         "started_at": None,
         "expires_at": remaining_to_expires_at(remaining),
-        "is_active": True,
+        "is_active": bool(remaining),
         "raw": {
             "entity_level": "lot",
             "keyword": keyword,
@@ -486,7 +486,7 @@ def parse_list_card(card, keyword, page):
         "published_at": None,
         "started_at": None,
         "expires_at": remaining_to_expires_at(remaining),
-        "is_active": True,
+        "is_active": bool(remaining),
         "raw": {
             "entity_level": "lot",
             "keyword": keyword,
@@ -557,6 +557,164 @@ def date_for_labels(text, labels):
                 return parsed
 
     return None
+
+
+
+def first_nonempty(*values):
+    for value in values:
+        if value is not None and clean_text(value):
+            return clean_text(value)
+    return None
+
+
+def parse_common_specs(text):
+    """
+    Осторожно извлекает только явно встречающиеся характеристики.
+    Ничего не выдумывает: если признак не найден, возвращает None.
+    """
+    s = clean_text(text)
+    low = s.lower()
+
+    ink_type = None
+    if re.search(r"\bлазерн", low):
+        ink_type = "Лазерный"
+    elif re.search(r"\bструйн", low):
+        ink_type = "Струйный"
+
+    color = None
+    color_map = [
+        (r"\bчерн(?:ый|ая|ое|ого)?\b", "Черный"),
+        (r"\bголуб(?:ой|ая|ое)\b|\bcyan\b", "Голубой"),
+        (r"\bпурпурн(?:ый|ая|ое)\b|\bmagenta\b", "Пурпурный"),
+        (r"\bжелт(?:ый|ая|ое)\b|\byellow\b", "Желтый"),
+    ]
+    for pattern, label in color_map:
+        if re.search(pattern, low, re.I):
+            color = label
+            break
+
+    compatibility = None
+    m = re.search(
+        r"(?:совместим\w*|для\s+(?:принтер\w*|мфу))[:\s\-]*([^|]{3,180})",
+        s,
+        re.I,
+    )
+    if m:
+        compatibility = clean_text(m.group(1))
+
+    yield_or_volume = None
+    m = re.search(
+        r"(\d[\d\s.,]*\s*(?:стр\.?|страниц\w*|мл|ml|г|гр|kg|кг))",
+        s,
+        re.I,
+    )
+    if m:
+        yield_or_volume = clean_text(m.group(1))
+
+    purpose = None
+    m = re.search(r"(предназначен\w*[^|]{3,180})", s, re.I)
+    if m:
+        purpose = clean_text(m.group(1))
+
+    return {
+        "ink_type": ink_type,
+        "color": color,
+        "compatibility": compatibility,
+        "yield_or_volume": yield_or_volume,
+        "purpose": purpose,
+    }
+
+
+def build_techspec_from_detail(body, row):
+    """
+    Формирует raw.techspec прямо из карточки ЛОТА Samruk.
+    Это не требует отдельного PDF: берем структурированные поля,
+    которые Samruk показывает в самой карточке лота.
+    """
+    short_description = label_value_from_lines(
+        body,
+        ["КРАТКАЯ ХАРАКТЕРИСТИКА"],
+    )
+    additional_description = label_value_from_lines(
+        body,
+        ["ДОПОЛНИТЕЛЬНОЕ ОПИСАНИЕ", "ДОП. ОПИСАНИЕ"],
+    )
+    quantity_text = label_value_from_lines(body, ["КОЛИЧЕСТВО"])
+    unit = label_value_from_lines(
+        body,
+        ["ЕД. ИЗМЕРЕНИЯ", "ЕДИНИЦА ИЗМЕРЕНИЯ"],
+    )
+    delivery_place = label_value_from_lines(body, ["МЕСТО ПОСТАВКИ"])
+    delivery_terms = label_value_from_lines(
+        body,
+        ["УСЛОВИЯ ПОСТАВКИ", "УСЛОВИЯ ПОСТАВКИ ТОВАРА"],
+    )
+    delivery_period = label_value_from_lines(
+        body,
+        ["СРОК ПОСТАВКИ", "СРОК ПОСТАВКИ ТОВАРА"],
+    )
+    payment_terms = label_value_from_lines(
+        body,
+        ["УСЛОВИЯ ОПЛАТЫ", "ПОРЯДОК ОПЛАТЫ"],
+    )
+    unit_price_text = label_value_from_lines(
+        body,
+        ["ЦЕНА ЗА ЕДИНИЦУ", "ЦЕНА ЗА ЕД."],
+    )
+    technical_requirements = label_value_from_lines(
+        body,
+        ["ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ", "ТЕХНИЧЕСКАЯ СПЕЦИФИКАЦИЯ"],
+    )
+    ens_tru = label_value_from_lines(body, ["КОД ЕНС ТРУ"])
+
+    specs_blob = " | ".join(
+        x for x in [
+            row.get("title"),
+            short_description,
+            additional_description,
+            technical_requirements,
+        ]
+        if x
+    )
+    parsed_fields = parse_common_specs(specs_blob)
+
+    techspec = {
+        "source": "samruk_lot_card",
+        "procurement_no": row.get("source_tender_id"),
+        "lot_id": row.get("source_lot_id"),
+        "ens_tru": ens_tru,
+        "short_description": short_description,
+        "additional_description": additional_description,
+        "quantity": number_to_float(quantity_text),
+        "unit": unit,
+        "unit_price": money_to_float(unit_price_text),
+        "amount": row.get("amount"),
+        "delivery_place": delivery_place,
+        "delivery_terms": delivery_terms,
+        "delivery_period": delivery_period,
+        "payment_terms": payment_terms,
+        "technical_requirements": technical_requirements,
+        "parsed_fields": parsed_fields,
+    }
+
+    meaningful = any(
+        techspec.get(key)
+        for key in (
+            "short_description",
+            "additional_description",
+            "quantity",
+            "unit",
+            "delivery_place",
+            "delivery_terms",
+            "delivery_period",
+            "payment_terms",
+            "technical_requirements",
+            "ens_tru",
+        )
+    )
+
+    return techspec if meaningful else None
+
 
 
 def wait_for_detail_text(driver, lot_id, timeout=WAIT_SECONDS):
@@ -919,11 +1077,16 @@ def enrich_from_open_detail(driver, row):
         ],
     )
 
-    doc_count, doc_urls, doc_names, has_techspec = extract_documents_metadata(driver)
+    doc_count, doc_urls, doc_names, document_has_techspec = extract_documents_metadata(driver)
 
-    # Родительскую закупку получаем в самом конце:
-    # переход на неё уже не мешает чтению полей лота.
-    parent_tender_id, parent_tender_url, parent_diag = extract_parent_tender_id_by_click(driver)
+    # Родительская закупка для радара не обязательна.
+    # Пытаемся прочитать её без перехода со страницы лота.
+    parent_tender_id = extract_parent_tender_id_without_click(driver)
+    parent_tender_url = None
+    parent_diag = []
+
+    # Структурированная техспецификация прямо из карточки лота.
+    techspec = build_techspec_from_detail(body, row)
 
     if customer:
         row["customer_name"] = customer
@@ -984,7 +1147,8 @@ def enrich_from_open_detail(driver, row):
         "document_urls": doc_urls,
         "document_names": doc_names,
         "has_documents": bool(doc_count or doc_urls),
-        "has_techspec": bool(has_techspec),
+        "has_techspec": bool(techspec or document_has_techspec),
+        "techspec": techspec,
         "detail_diagnostic_lines": diagnostic_lines,
     })
 
@@ -1150,13 +1314,24 @@ def collect(driver):
 
 
 def enrich_rows(driver, rows):
+    # Актуальность на этом этапе определяется текущей выдачей Samruk:
+    # у открытых лотов есть "Осталось: ...".
+    # Количество НЕ фиксировано: сегодня 11, завтра может быть 7, 15, 30...
+    active_targets = [
+        r for r in rows
+        if clean_text((r.get("raw") or {}).get("remaining_text"))
+    ]
+
     if DETAIL_LIMIT > 0:
-        targets = rows[:DETAIL_LIMIT]
+        # Используется только быстрым тестовым workflow.
+        targets = active_targets[:DETAIL_LIMIT]
     else:
-        targets = rows
+        # Основной облачный цикл: ВСЕ актуальные лоты.
+        targets = active_targets
 
     print("")
-    print("DETAIL TARGETS:", len(targets), "/", len(rows))
+    print("CURRENT ACTIVE LOTS:", len(active_targets))
+    print("DETAIL TARGETS:", len(targets), "/", len(active_targets))
 
     for idx, row in enumerate(targets, 1):
         lot_id = row["source_lot_id"]
@@ -1165,7 +1340,6 @@ def enrich_rows(driver, rows):
         search_url = lot_search_url(keyword, page)
 
         try:
-            # На всякий случай возвращаемся на нужную страницу поиска.
             if (
                 f"page={page}" not in (driver.current_url or "")
                 or "tabs=lot" not in (driver.current_url or "")
@@ -1179,13 +1353,14 @@ def enrich_rows(driver, rows):
             click_lot_card(driver, lot_id)
             enrich_from_open_detail(driver, row)
 
+            techspec_ok = bool((row.get("raw") or {}).get("techspec"))
             print(
-                "  OK | tender:",
-                row.get("source_tender_id"),
-                "| customer:",
+                "  OK | customer:",
                 row.get("customer_name"),
                 "| expires:",
                 row.get("expires_at"),
+                "| techspec:",
+                techspec_ok,
             )
 
         except Exception as e:
@@ -1195,7 +1370,6 @@ def enrich_rows(driver, rows):
             print("  WARNING detail failed:", lot_id, repr(e))
 
         finally:
-            # Сохраняем прогресс после каждой карточки.
             save_results(rows)
 
             try:
@@ -1204,11 +1378,20 @@ def enrich_rows(driver, rows):
             except Exception:
                 pass
 
-    # Строки вне тестового лимита не считаем ошибкой.
+    # Все лоты без "Осталось" сейчас считаем неактивными.
+    active_ids = {str(r.get("source_lot_id")) for r in active_targets}
+    for row in rows:
+        if str(row.get("source_lot_id")) not in active_ids:
+            row["is_active"] = False
+
+    # В тестовом режиме лоты за пределами лимита остаются активными,
+    # просто не детализируются.
     if DETAIL_LIMIT > 0:
-        for row in rows[len(targets):]:
-            row["raw"]["detail_checked"] = False
-            row["raw"]["detail_error"] = "DETAIL_LIMIT reached (test mode)"
+        target_ids = {str(r.get("source_lot_id")) for r in targets}
+        for row in active_targets:
+            if str(row.get("source_lot_id")) not in target_ids:
+                row["raw"]["detail_checked"] = False
+                row["raw"]["detail_error"] = "DETAIL_LIMIT reached (test mode)"
 
     return rows
 
@@ -1217,7 +1400,7 @@ def main():
     print("=" * 78)
     print("TENDER RADAR KZ - SAMRUK LOT COLLECTOR")
     print("ENTITY LEVEL: LOT")
-    print("DETAIL OPEN METHOD: CLICK + WAIT FULL DETAIL + PARENT TENDER CLICK")
+    print("DETAIL MODE: ALL CURRENT ACTIVE LOTS + EXACT DEADLINE + TECHSPEC")
     print("MODE: READ ONLY, NO SUPABASE WRITE")
     print("=" * 78)
 
@@ -1239,11 +1422,13 @@ def main():
         print("")
         print("ALL RELEVANT LOTS:", len(rows))
         print("GOODS SAVED:", len(goods_rows))
-        print("DETAILS TARGETED:", len(rows) if DETAIL_LIMIT <= 0 else min(DETAIL_LIMIT, len(rows)))
+        print("CURRENT ACTIVE LOTS:", sum(bool(clean_text((r.get("raw") or {}).get("remaining_text"))) for r in rows))
+        print("DETAILS TARGETED:", sum((r.get("raw") or {}).get("detail_checked") is True or (r.get("raw") or {}).get("detail_error") not in (None, "DETAIL_LIMIT reached (test mode)") for r in rows))
         print("DETAILS OK:", sum(r.get("raw", {}).get("detail_checked") is True for r in rows))
         print("WITH EXPIRES_AT:", sum(bool(r.get("expires_at")) for r in rows))
         print("WITH CUSTOMER:", sum(bool(r.get("customer_name")) for r in rows))
         print("WITH PARENT TENDER:", sum(bool(r.get("source_tender_id")) for r in rows))
+        print("WITH TECHSPEC:", sum(bool((r.get("raw") or {}).get("techspec")) for r in rows))
         print("ALL JSON:", all_json)
         print("JSON:", json_path)
         print("CSV :", csv_path)
