@@ -375,7 +375,7 @@ def main():
                 # В основном облачном цикле подробно открываем только несколько
                 # лотов, чтобы обновление не растягивалось на десятки минут.
                 # Все найденные лоты всё равно сохраняются из списка Samruk.
-                "SAMRUK_DETAIL_LIMIT": os.getenv("SAMRUK_DETAIL_LIMIT", "3"),
+                "SAMRUK_DETAIL_LIMIT": os.getenv("SAMRUK_DETAIL_LIMIT", "0"),
             },
         )
         rows = make_samruk()
