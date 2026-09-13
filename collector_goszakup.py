@@ -29,16 +29,24 @@ Goszakup Collector v1.2 TECHSPEC RESTORE
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urljoin
 
 import requests
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
 
 GRAPHQL_URL = "https://ows.goszakup.gov.kz/v3/graphql"
 PUBLIC_ANNOUNCE_URL = "https://www.goszakup.gov.kz/ru/announce/index/{number_anno}"
@@ -314,12 +322,155 @@ def parse_product_fields(text: str) -> Dict[str, str]:
         out["purpose"] = src[:180]
     return out
 
-def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Строит raw.techspec из структурированных полей GraphQL v3.
+_PDF_TECHSPEC_CACHE: Dict[str, Dict[str, Any]] = {}
 
-    Важно: это не OCR/PDF-парсер. На этом шаге используем официальные открытые
-    поля лота/пункта плана и метаданные документов. Сам PDF сохраняется в files.
-    """
+
+def _tech_file_score(f: Dict[str, Any]) -> int:
+    blob = " ".join(_compact_text(f.get(k)).lower() for k in ("nameRu", "nameKz", "originalName", "filePath"))
+    score = 0
+    if "техничес" in blob:
+        score += 10
+    if "спецификац" in blob:
+        score += 10
+    if "techspec" in blob or "tech_spec" in blob:
+        score += 10
+    if ".pdf" in blob:
+        score += 2
+    if "договор" in blob:
+        score -= 5
+    return score
+
+
+def _choose_tech_file(files: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    candidates = [f for f in files if isinstance(f, dict)]
+    if not candidates:
+        return None
+    candidates.sort(key=_tech_file_score, reverse=True)
+    best = candidates[0]
+    return best if _tech_file_score(best) > 0 else None
+
+
+def _pdf_url_candidates(file_path: str) -> List[str]:
+    p = _compact_text(file_path)
+    if not p:
+        return []
+    if p.startswith("http://") or p.startswith("https://"):
+        return [p]
+    pp = p if p.startswith("/") else "/" + p
+    bases = (
+        "https://ows.goszakup.gov.kz",
+        "https://goszakup.gov.kz",
+        "https://www.goszakup.gov.kz",
+        "https://procurement.gov.kz",
+        "https://old.goszakup.gov.kz",
+        "https://zakup.gov.kz",
+    )
+    out: List[str] = []
+    seen = set()
+    for base in bases:
+        u = urljoin(base, pp)
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _looks_like_pdf(content: bytes, content_type: str) -> bool:
+    return content[:16].startswith(b"%PDF") or "pdf" in (content_type or "").lower()
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    if PdfReader is None:
+        raise RuntimeError("pypdf is not installed")
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    parts: List[str] = []
+    for page in reader.pages:
+        parts.append(page.extract_text() or "")
+    value = "\n".join(parts).replace("\u00ad", "").replace("\u200b", "")
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def _russian_pdf_part(text: str) -> str:
+    # Госзакуп часто отдаёт двуязычный PDF: сначала казахская, затем русская часть.
+    m = re.search(r"(?i)Техническая\s+спецификация", text)
+    return text[m.start():] if m else text
+
+
+def _extract_requirements_from_pdf(text: str) -> str:
+    ru = _russian_pdf_part(text)
+    flat = _compact_text(ru)
+    patterns = [
+        r"Описание и требуемые функциональные, технические, качественные и эксплуатационные характеристики закупаемых товаров:\s*(.+)$",
+        r"характеристики закупаемых товаров:\s*(.+)$",
+        r"технические требования:\s*(.+)$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, flat, re.I | re.S)
+        if m:
+            value = _compact_text(m.group(1))
+            if value:
+                return value[:12000]
+    # Fallback: сохраняем русскую часть, но ограничиваем объём для карточки/БД.
+    return flat[:12000]
+
+
+def _download_and_parse_techspec(tech_file: Dict[str, Any]) -> Dict[str, Any]:
+    """Безопасно скачивает и разбирает PDF. Любая ошибка возвращается в meta и не роняет сбор."""
+    file_path = _compact_text(tech_file.get("filePath"))
+    cache_key = file_path or str(tech_file.get("id") or tech_file.get("objectId") or "")
+    if cache_key and cache_key in _PDF_TECHSPEC_CACHE:
+        return _PDF_TECHSPEC_CACHE[cache_key]
+
+    result: Dict[str, Any] = {
+        "ok": False,
+        "source_url": None,
+        "text": None,
+        "requirements": None,
+        "error": None,
+    }
+    if PdfReader is None:
+        result["error"] = "pypdf_not_installed"
+        if cache_key:
+            _PDF_TECHSPEC_CACHE[cache_key] = result
+        return result
+
+    token = os.getenv("GOSZAKUP_TOKEN", "").strip()
+    session = requests.Session()
+    last_error = None
+    for url in _pdf_url_candidates(file_path):
+        for headers in (
+            {"Authorization": f"Bearer {token}", "User-Agent": "Tender-Radar-KZ/0.4.3"} if token else {"User-Agent": "Tender-Radar-KZ/0.4.3"},
+            {"User-Agent": "Mozilla/5.0 Tender-Radar-KZ/0.4.3"},
+        ):
+            try:
+                r = session.get(url, headers=headers, timeout=45, allow_redirects=True)
+                if r.ok and _looks_like_pdf(r.content, r.headers.get("content-type", "")):
+                    pdf_text = _extract_pdf_text(r.content)
+                    req = _extract_requirements_from_pdf(pdf_text)
+                    result.update({
+                        "ok": bool(pdf_text),
+                        "source_url": r.url,
+                        "text": pdf_text[:30000] if pdf_text else None,
+                        "requirements": req or None,
+                        "error": None,
+                    })
+                    if cache_key:
+                        _PDF_TECHSPEC_CACHE[cache_key] = result
+                    return result
+                last_error = f"HTTP {r.status_code}, content-type={r.headers.get('content-type','')}"
+            except Exception as e:
+                last_error = repr(e)
+
+    result["error"] = last_error or "pdf_download_failed"
+    if cache_key:
+        _PDF_TECHSPEC_CACHE[cache_key] = result
+    return result
+
+
+def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Строит raw.techspec из GraphQL v3 и, если доступен, текста официального PDF."""
     plans = lot.get("Plans") if isinstance(lot.get("Plans"), list) else []
     plan = next((x for x in plans if isinstance(x, dict)), {})
     files = lot.get("Files") if isinstance(lot.get("Files"), list) else []
@@ -366,8 +517,15 @@ def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "is_techspec": bool(is_tech),
         })
 
-    requirements = _uniq_join([lot_desc, extra_desc], sep="\n")
-    parsed = parse_product_fields(_uniq_join([title, lot_desc, short_desc, extra_desc]))
+    pdf_info: Dict[str, Any] = {}
+    selected_tech_file = _choose_tech_file(files)
+    if selected_tech_file:
+        pdf_info = _download_and_parse_techspec(selected_tech_file)
+
+    pdf_requirements = _compact_text(pdf_info.get("requirements")) if pdf_info else ""
+    requirements = pdf_requirements or _uniq_join([lot_desc, extra_desc], sep="\n")
+    parse_source = _uniq_join([title, lot_desc, short_desc, extra_desc, pdf_requirements])
+    parsed = parse_product_fields(parse_source)
 
     # Не создаем пустую фиктивную техспецификацию: нужен хотя бы один
     # содержательный источник (план, описание или документы).
@@ -390,6 +548,10 @@ def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "parsed_fields": parsed,
         "files": tech_files,
         "has_techspec_file": any(x.get("is_techspec") for x in tech_files),
+        "pdf_downloaded": bool(pdf_info.get("ok")) if pdf_info else False,
+        "pdf_source_url": pdf_info.get("source_url") if pdf_info else None,
+        "pdf_text": pdf_info.get("text") if pdf_info and pdf_info.get("ok") else None,
+        "pdf_error": pdf_info.get("error") if pdf_info and not pdf_info.get("ok") else None,
     }
 
 def normalize(lot: Dict[str, Any], keyword: str) -> Tender:
