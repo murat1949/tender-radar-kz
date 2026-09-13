@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Goszakup Collector v1
+Goszakup Collector v1.2 TECHSPEC RESTORE
 ---------------------
 Первая рабочая версия сборщика для портала мониторинга закупок.
 
@@ -15,15 +15,15 @@ Goszakup Collector v1
   3) нормализует данные;
   4) считает простой приоритет;
   5) сохраняет JSON/CSV;
-  6) НЕ пишет в Supabase напрямую: синхронизацию выполняет auto_collect_and_sync.py.
+  6) при наличии параметров Supabase — отправляет данные в таблицу tenders.
 
 Для живого API нужен официальный токен goszakup.
 Указать его в переменной среды:
   GOSZAKUP_TOKEN=...
 
-Важно:
-  Этот сборщик только получает и сохраняет JSON/CSV.
-  Запись в Supabase выполняет основной orchestrator auto_collect_and_sync.py.
+Опционально:
+  SUPABASE_URL=https://xxxx.supabase.co
+  SUPABASE_SERVICE_ROLE_KEY=...
 """
 
 from __future__ import annotations
@@ -77,17 +77,23 @@ query SearchLots($limit: Int, $after: Int, $filter: LotsFiltersInput) {
     disablePersonId
     Plans {
       id
-      count
-      refUnitsCode
+      nameRu
       descRu
       extraDescRu
+      count
+      refUnitsCode
       supplyDateRu
       prepayment
+      PlansKato {
+        fullDeliveryPlaceNameRu
+        count
+      }
     }
     Files {
       id
       filePath
       originalName
+      objectId
       nameRu
       indexDate
     }
@@ -171,7 +177,7 @@ class Tender:
     keyword: str
     priority_score: int
     priority_label: str
-    techspec: Dict[str, Any]
+    techspec: Optional[Dict[str, Any]]
     collected_at: str
 
 def env(name: str, default: str = "") -> str:
@@ -255,91 +261,136 @@ def score_tender(lot: Dict[str, Any]) -> tuple[int, str]:
         label = "⚪ В базе"
     return score, label
 
+def _compact_text(v: Any) -> str:
+    return " ".join(str(v or "").replace("\r", " ").replace("\n", " ").split())
 
-def build_techspec(lot: Dict[str, Any]) -> Dict[str, Any]:
-    """Формирует raw.techspec для Tender Radar KZ из официальных полей Goszakup GraphQL."""
+def _uniq_join(values: Iterable[Any], sep: str = "; ") -> str:
+    out: List[str] = []
+    seen = set()
+    for v in values:
+        s = _compact_text(v)
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            out.append(s)
+    return sep.join(out)
+
+def parse_product_fields(text: str) -> Dict[str, str]:
+    """Небольшой безопасный разбор товарных характеристик из открытого текста API."""
+    import re
+    src = _compact_text(text)
+    low = src.lower()
+    out: Dict[str, str] = {}
+
+    if "тонер" in low:
+        out["ink_type"] = "тонер"
+    elif "чернил" in low:
+        out["ink_type"] = "чернила"
+
+    colors = [
+        (r"\bчерн(?:ый|ого|ая|ое)?\b|\bblack\b", "черный"),
+        (r"\bголуб(?:ой|ого|ая|ое)?\b|\bcyan\b", "голубой"),
+        (r"\bпурпурн(?:ый|ого|ая|ое)?\b|\bmagenta\b", "пурпурный"),
+        (r"\bжелт(?:ый|ого|ая|ое)?\b|\byellow\b", "желтый"),
+    ]
+    for pat, label in colors:
+        if re.search(pat, low, re.I):
+            out["color"] = label
+            break
+
+    # Совместимость: бренд + модель или фраза после "для принтера/МФУ".
+    m = re.search(r"(?:для\s+(?:принтера|мфу)\s+)([^.;,]{3,90})", src, re.I)
+    if m:
+        out["compatibility"] = _compact_text(m.group(1))
+    else:
+        m = re.search(r"\b(HP|Canon|Kyocera|Xerox|Pantum|Samsung|Brother|Epson)\b\s+([A-Za-z0-9][A-Za-z0-9+_.\-/ ]{1,45})", src, re.I)
+        if m:
+            out["compatibility"] = _compact_text(m.group(1) + " " + m.group(2)).rstrip(' .;,')
+
+    m = re.search(r"\b(\d[\d\s.,]*)\s*(стр(?:аниц(?:ы|а)?)?|pages?|мл|ml|г|гр|kg|кг)\b", low, re.I)
+    if m:
+        out["yield_or_volume"] = _compact_text(m.group(1) + " " + m.group(2))
+
+    if src:
+        out["purpose"] = src[:180]
+    return out
+
+def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Строит raw.techspec из структурированных полей GraphQL v3.
+
+    Важно: это не OCR/PDF-парсер. На этом шаге используем официальные открытые
+    поля лота/пункта плана и метаданные документов. Сам PDF сохраняется в files.
+    """
     plans = lot.get("Plans") if isinstance(lot.get("Plans"), list) else []
+    plan = next((x for x in plans if isinstance(x, dict)), {})
     files = lot.get("Files") if isinstance(lot.get("Files"), list) else []
-    plan = next((x for x in plans if isinstance(x, dict)), {}) if plans else {}
+    files = [x for x in files if isinstance(x, dict)]
 
-    buy = lot.get("TrdBuy") or {}
-    ann = str(safe(lot, "trdBuyNumberAnno") or safe(buy, "numberAnno") or "")
-    lot_id = str(safe(lot, "lotNumber") or safe(lot, "id") or "")
+    ann = str(safe(lot, "trdBuyNumberAnno") or safe(lot.get("TrdBuy") or {}, "numberAnno"))
+    lot_no = str(safe(lot, "lotNumber") or safe(lot, "id"))
+    title = _compact_text(safe(lot, "nameRu"))
+    lot_desc = _compact_text(safe(lot, "descriptionRu"))
+    short_desc = _compact_text(plan.get("descRu") or plan.get("nameRu") or lot_desc or title)
+    extra_desc = _compact_text(plan.get("extraDescRu"))
 
-    def first_nonempty(*values):
-        for v in values:
-            if v is None:
-                continue
-            if isinstance(v, str):
-                v = v.strip()
-                if v:
-                    return v
-            elif v != "":
-                return v
+    places = []
+    for k in (plan.get("PlansKato") if isinstance(plan.get("PlansKato"), list) else []):
+        if isinstance(k, dict):
+            places.append(k.get("fullDeliveryPlaceNameRu"))
+    delivery_place = _uniq_join(places)
+
+    quantity = plan.get("count") if plan.get("count") is not None else lot.get("count")
+    unit = _compact_text(plan.get("refUnitsCode"))
+    # Госзакуп код 796 = штука. Текущий UI показывает unit как текст,
+    # поэтому нормализуем здесь, чтобы не было "3 796".
+    if unit == "796":
+        unit = "шт."
+    delivery_period = _compact_text(plan.get("supplyDateRu"))
+    prepayment = plan.get("prepayment")
+    payment_terms = ""
+    if prepayment is not None and str(prepayment).strip() != "":
+        payment_terms = "Предоплата: %s%%" % prepayment
+
+    tech_files = []
+    for f in files:
+        label = _compact_text(f.get("nameRu") or f.get("originalName"))
+        orig = _compact_text(f.get("originalName"))
+        is_tech = ("техничес" in label.lower() or "техспец" in label.lower() or
+                   "techspec" in label.lower() or "tech_spec" in label.lower() or
+                   "техничес" in orig.lower() or "techspec" in orig.lower())
+        tech_files.append({
+            "id": f.get("id"),
+            "name": label or orig,
+            "original_name": orig,
+            "file_path": f.get("filePath"),
+            "index_date": f.get("indexDate"),
+            "is_techspec": bool(is_tech),
+        })
+
+    requirements = _uniq_join([lot_desc, extra_desc], sep="\n")
+    parsed = parse_product_fields(_uniq_join([title, lot_desc, short_desc, extra_desc]))
+
+    # Не создаем пустую фиктивную техспецификацию: нужен хотя бы один
+    # содержательный источник (план, описание или документы).
+    if not (plan or lot_desc or files):
         return None
 
-    # Находим документ, который больше всего похож на техническую спецификацию.
-    tech_file = None
-    for f in files:
-        if not isinstance(f, dict):
-            continue
-        blob = " ".join(str(f.get(k) or "") for k in ("nameRu", "originalName")).lower()
-        if "техническ" in blob or "спецификац" in blob or "techspec" in blob:
-            tech_file = f
-            break
-    if tech_file is None and files:
-        tech_file = next((f for f in files if isinstance(f, dict)), None)
-
-    qty = first_nonempty(plan.get("count"), lot.get("count"))
-    unit = first_nonempty(plan.get("refUnitsCode"))
-    short_desc = first_nonempty(plan.get("descRu"), lot.get("descriptionRu"), lot.get("nameRu"))
-    extra_desc = first_nonempty(plan.get("extraDescRu"))
-    delivery_period = first_nonempty(plan.get("supplyDateRu"))
-
-    prepayment = plan.get("prepayment")
-    payment_terms = None
-    if prepayment is not None and str(prepayment).strip() != "":
-        payment_terms = "Предоплата: {}%".format(prepayment)
-
-    # В Lots есть список кодов мест поставки. Это не человекочитаемый адрес,
-    # но сохраняем его как доступный официальный признак, не выдумывая адрес.
-    kato = lot.get("plnPointKatoList")
-    delivery_place = None
-    if isinstance(kato, list) and kato:
-        delivery_place = ", ".join(str(x) for x in kato if x is not None)
-
-    spec = {
+    return {
+        "source": "goszakup_graphql_v3",
         "procurement_no": ann or None,
-        "lot_id": lot_id or None,
-        "short_description": short_desc,
-        "quantity": qty,
-        "unit": unit,
-        "delivery_place": delivery_place,
+        "lot_id": lot_no or None,
+        "short_description": short_desc or None,
+        "quantity": quantity,
+        "unit": unit or None,
+        "delivery_place": delivery_place or None,
         "delivery_terms": None,
-        "delivery_period": delivery_period,
-        "payment_terms": payment_terms,
-        "additional_description": extra_desc,
-        "technical_requirements": first_nonempty(lot.get("descriptionRu")),
-        "parsed_fields": {},
+        "delivery_period": delivery_period or None,
+        "payment_terms": payment_terms or None,
+        "additional_description": extra_desc or None,
+        "technical_requirements": requirements or None,
+        "parsed_fields": parsed,
+        "files": tech_files,
+        "has_techspec_file": any(x.get("is_techspec") for x in tech_files),
     }
-
-    if tech_file:
-        spec["file"] = {
-            "id": tech_file.get("id"),
-            "name": first_nonempty(tech_file.get("nameRu"), tech_file.get("originalName")),
-            "original_name": tech_file.get("originalName"),
-            "file_path": tech_file.get("filePath"),
-            "index_date": tech_file.get("indexDate"),
-        }
-
-    # Не создаём пустой блок techspec: нужен хотя бы один полезный признак.
-    useful = [
-        spec.get("short_description"), spec.get("quantity"), spec.get("delivery_period"),
-        spec.get("additional_description"), spec.get("technical_requirements"),
-        spec.get("file")
-    ]
-    return spec if any(v not in (None, "", {}, []) for v in useful) else {}
-
 
 def normalize(lot: Dict[str, Any], keyword: str) -> Tender:
     buy = lot.get("TrdBuy") or {}
@@ -351,7 +402,6 @@ def normalize(lot: Dict[str, Any], keyword: str) -> Tender:
     score, label = score_tender(lot)
     ann = str(safe(lot, "trdBuyNumberAnno") or safe(buy, "numberAnno"))
     external_id = str(safe(lot, "id"))
-    techspec = build_techspec(lot)
 
     return Tender(
         source="goszakup.gov.kz",
@@ -379,7 +429,7 @@ def normalize(lot: Dict[str, Any], keyword: str) -> Tender:
         keyword=keyword,
         priority_score=score,
         priority_label=label,
-        techspec=techspec,
+        techspec=build_techspec(lot),
         collected_at=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -430,6 +480,55 @@ def save_csv(items: List[Tender]) -> Path:
             w.writerow(asdict(item))
     return path
 
+def upload_supabase(items: List[Tender]) -> None:
+    url = env("SUPABASE_URL")
+    key = env("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key or not items:
+        return
+
+    endpoint = url.rstrip("/") + "/rest/v1/tenders"
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }
+
+    payload = []
+    for t in items:
+        d = asdict(t)
+        payload.append({
+            "source": d["source"],
+            "external_id": d["external_id"],
+            "lot_number": d["lot_number"],
+            "announcement_number": d["announcement_number"],
+            "title": d["title"],
+            "description": d["description"],
+            "customer_name": d["customer_name"],
+            "customer_bin": d["customer_bin"],
+            "organizer_name": d["organizer_name"],
+            "organizer_bin": d["organizer_bin"],
+            "amount_kzt": d["amount_kzt"],
+            "quantity": d["quantity"],
+            "publish_date": d["publish_date"] or None,
+            "start_date": d["start_date"] or None,
+            "end_date": d["end_date"] or None,
+            "status": d["status"],
+            "trade_method": d["trade_method"],
+            "customer_phone": d["customer_phone"],
+            "customer_email": d["customer_email"],
+            "organizer_phone": d["organizer_phone"],
+            "organizer_email": d["organizer_email"],
+            "public_url": d["public_url"],
+            "keyword": d["keyword"],
+            "priority_score": d["priority_score"],
+            "priority_label": d["priority_label"],
+            "collected_at": d["collected_at"],
+        })
+
+    r = requests.post(endpoint, headers=headers, json=payload, timeout=45)
+    r.raise_for_status()
+
 def load_keywords() -> List[str]:
     raw = env("GOSZAKUP_KEYWORDS")
     if raw:
@@ -446,7 +545,7 @@ def main() -> int:
     keywords = load_keywords()
     all_items: List[Tender] = []
 
-    print("ProcureVision KZ — Goszakup Collector v1")
+    print("ProcureVision KZ — Goszakup Collector v1.2 TECHSPEC RESTORE")
     print("Ключевые слова:", ", ".join(keywords))
 
     for keyword in keywords:
@@ -463,7 +562,12 @@ def main() -> int:
     json_path = save_json(items)
     csv_path = save_csv(items)
 
-    print("Supabase: direct write disabled; main sync is handled by auto_collect_and_sync.py")
+    try:
+        upload_supabase(items)
+        if env("SUPABASE_URL") and env("SUPABASE_SERVICE_ROLE_KEY"):
+            print("Supabase: данные отправлены.")
+    except Exception as e:
+        print(f"Supabase error: {e}", file=sys.stderr)
 
     print(f"Итого уникальных лотов: {len(items)}")
     print(f"JSON: {json_path}")
