@@ -1,0 +1,38 @@
+name: Goszakup PDF Techspec Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip requests pypdf
+
+      - name: Run Goszakup PDF techspec test
+        env:
+          GOSZAKUP_TOKEN: ${{ secrets.GOSZAKUP_TOKEN }}
+          CONTROL_LOT: "87884071-3ЦП1"
+        run: python -u goszakup_pdf_techspec_test.py
+
+      - name: Upload diagnostic output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goszakup-pdf-techspec-test-output
+          path: output/
+          if-no-files-found: warn
