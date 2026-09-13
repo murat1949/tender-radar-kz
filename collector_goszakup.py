@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Goszakup Collector v1.2 TECHSPEC RESTORE
+Goszakup Collector v1.3 PDF TECHSPEC
 ---------------------
 Первая рабочая версия сборщика для портала мониторинга закупок.
 
@@ -39,14 +39,10 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-
-try:
-    from pypdf import PdfReader
-except ImportError:
-    PdfReader = None
+from pypdf import PdfReader
 
 GRAPHQL_URL = "https://ows.goszakup.gov.kz/v3/graphql"
 PUBLIC_ANNOUNCE_URL = "https://www.goszakup.gov.kz/ru/announce/index/{number_anno}"
@@ -322,155 +318,12 @@ def parse_product_fields(text: str) -> Dict[str, str]:
         out["purpose"] = src[:180]
     return out
 
-_PDF_TECHSPEC_CACHE: Dict[str, Dict[str, Any]] = {}
-
-
-def _tech_file_score(f: Dict[str, Any]) -> int:
-    blob = " ".join(_compact_text(f.get(k)).lower() for k in ("nameRu", "nameKz", "originalName", "filePath"))
-    score = 0
-    if "техничес" in blob:
-        score += 10
-    if "спецификац" in blob:
-        score += 10
-    if "techspec" in blob or "tech_spec" in blob:
-        score += 10
-    if ".pdf" in blob:
-        score += 2
-    if "договор" in blob:
-        score -= 5
-    return score
-
-
-def _choose_tech_file(files: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    candidates = [f for f in files if isinstance(f, dict)]
-    if not candidates:
-        return None
-    candidates.sort(key=_tech_file_score, reverse=True)
-    best = candidates[0]
-    return best if _tech_file_score(best) > 0 else None
-
-
-def _pdf_url_candidates(file_path: str) -> List[str]:
-    p = _compact_text(file_path)
-    if not p:
-        return []
-    if p.startswith("http://") or p.startswith("https://"):
-        return [p]
-    pp = p if p.startswith("/") else "/" + p
-    bases = (
-        "https://ows.goszakup.gov.kz",
-        "https://goszakup.gov.kz",
-        "https://www.goszakup.gov.kz",
-        "https://procurement.gov.kz",
-        "https://old.goszakup.gov.kz",
-        "https://zakup.gov.kz",
-    )
-    out: List[str] = []
-    seen = set()
-    for base in bases:
-        u = urljoin(base, pp)
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
-
-
-def _looks_like_pdf(content: bytes, content_type: str) -> bool:
-    return content[:16].startswith(b"%PDF") or "pdf" in (content_type or "").lower()
-
-
-def _extract_pdf_text(pdf_bytes: bytes) -> str:
-    if PdfReader is None:
-        raise RuntimeError("pypdf is not installed")
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    parts: List[str] = []
-    for page in reader.pages:
-        parts.append(page.extract_text() or "")
-    value = "\n".join(parts).replace("\u00ad", "").replace("\u200b", "")
-    value = re.sub(r"[ \t]+", " ", value)
-    value = re.sub(r"\n{3,}", "\n\n", value)
-    return value.strip()
-
-
-def _russian_pdf_part(text: str) -> str:
-    # Госзакуп часто отдаёт двуязычный PDF: сначала казахская, затем русская часть.
-    m = re.search(r"(?i)Техническая\s+спецификация", text)
-    return text[m.start():] if m else text
-
-
-def _extract_requirements_from_pdf(text: str) -> str:
-    ru = _russian_pdf_part(text)
-    flat = _compact_text(ru)
-    patterns = [
-        r"Описание и требуемые функциональные, технические, качественные и эксплуатационные характеристики закупаемых товаров:\s*(.+)$",
-        r"характеристики закупаемых товаров:\s*(.+)$",
-        r"технические требования:\s*(.+)$",
-    ]
-    for pat in patterns:
-        m = re.search(pat, flat, re.I | re.S)
-        if m:
-            value = _compact_text(m.group(1))
-            if value:
-                return value[:12000]
-    # Fallback: сохраняем русскую часть, но ограничиваем объём для карточки/БД.
-    return flat[:12000]
-
-
-def _download_and_parse_techspec(tech_file: Dict[str, Any]) -> Dict[str, Any]:
-    """Безопасно скачивает и разбирает PDF. Любая ошибка возвращается в meta и не роняет сбор."""
-    file_path = _compact_text(tech_file.get("filePath"))
-    cache_key = file_path or str(tech_file.get("id") or tech_file.get("objectId") or "")
-    if cache_key and cache_key in _PDF_TECHSPEC_CACHE:
-        return _PDF_TECHSPEC_CACHE[cache_key]
-
-    result: Dict[str, Any] = {
-        "ok": False,
-        "source_url": None,
-        "text": None,
-        "requirements": None,
-        "error": None,
-    }
-    if PdfReader is None:
-        result["error"] = "pypdf_not_installed"
-        if cache_key:
-            _PDF_TECHSPEC_CACHE[cache_key] = result
-        return result
-
-    token = os.getenv("GOSZAKUP_TOKEN", "").strip()
-    session = requests.Session()
-    last_error = None
-    for url in _pdf_url_candidates(file_path):
-        for headers in (
-            {"Authorization": f"Bearer {token}", "User-Agent": "Tender-Radar-KZ/0.4.3"} if token else {"User-Agent": "Tender-Radar-KZ/0.4.3"},
-            {"User-Agent": "Mozilla/5.0 Tender-Radar-KZ/0.4.3"},
-        ):
-            try:
-                r = session.get(url, headers=headers, timeout=45, allow_redirects=True)
-                if r.ok and _looks_like_pdf(r.content, r.headers.get("content-type", "")):
-                    pdf_text = _extract_pdf_text(r.content)
-                    req = _extract_requirements_from_pdf(pdf_text)
-                    result.update({
-                        "ok": bool(pdf_text),
-                        "source_url": r.url,
-                        "text": pdf_text[:30000] if pdf_text else None,
-                        "requirements": req or None,
-                        "error": None,
-                    })
-                    if cache_key:
-                        _PDF_TECHSPEC_CACHE[cache_key] = result
-                    return result
-                last_error = f"HTTP {r.status_code}, content-type={r.headers.get('content-type','')}"
-            except Exception as e:
-                last_error = repr(e)
-
-    result["error"] = last_error or "pdf_download_failed"
-    if cache_key:
-        _PDF_TECHSPEC_CACHE[cache_key] = result
-    return result
-
-
 def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Строит raw.techspec из GraphQL v3 и, если доступен, текста официального PDF."""
+    """Строит базовый raw.techspec из GraphQL v3.
+
+    Полный текст PDF добавляется после дедупликации функцией enrich_pdf_techspec(),
+    чтобы не скачивать один и тот же документ повторно для разных ключевых слов.
+    """
     plans = lot.get("Plans") if isinstance(lot.get("Plans"), list) else []
     plan = next((x for x in plans if isinstance(x, dict)), {})
     files = lot.get("Files") if isinstance(lot.get("Files"), list) else []
@@ -517,15 +370,8 @@ def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "is_techspec": bool(is_tech),
         })
 
-    pdf_info: Dict[str, Any] = {}
-    selected_tech_file = _choose_tech_file(files)
-    if selected_tech_file:
-        pdf_info = _download_and_parse_techspec(selected_tech_file)
-
-    pdf_requirements = _compact_text(pdf_info.get("requirements")) if pdf_info else ""
-    requirements = pdf_requirements or _uniq_join([lot_desc, extra_desc], sep="\n")
-    parse_source = _uniq_join([title, lot_desc, short_desc, extra_desc, pdf_requirements])
-    parsed = parse_product_fields(parse_source)
+    requirements = _uniq_join([lot_desc, extra_desc], sep="\n")
+    parsed = parse_product_fields(_uniq_join([title, lot_desc, short_desc, extra_desc]))
 
     # Не создаем пустую фиктивную техспецификацию: нужен хотя бы один
     # содержательный источник (план, описание или документы).
@@ -548,11 +394,168 @@ def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "parsed_fields": parsed,
         "files": tech_files,
         "has_techspec_file": any(x.get("is_techspec") for x in tech_files),
-        "pdf_downloaded": bool(pdf_info.get("ok")) if pdf_info else False,
-        "pdf_source_url": pdf_info.get("source_url") if pdf_info else None,
-        "pdf_text": pdf_info.get("text") if pdf_info and pdf_info.get("ok") else None,
-        "pdf_error": pdf_info.get("error") if pdf_info and not pdf_info.get("ok") else None,
     }
+
+
+def _looks_like_pdf(content: bytes, content_type: str = "") -> bool:
+    return bool(content) and (content[:16].startswith(b"%PDF") or "pdf" in (content_type or "").lower())
+
+
+def _url_candidates(file_path: str) -> List[str]:
+    p = _compact_text(file_path)
+    if not p:
+        return []
+    if p.startswith("http://") or p.startswith("https://"):
+        return [p]
+    pp = p if p.startswith("/") else "/" + p
+    bases = (
+        "https://ows.goszakup.gov.kz",
+        "https://goszakup.gov.kz",
+        "https://www.goszakup.gov.kz",
+        "https://procurement.gov.kz",
+        "https://old.goszakup.gov.kz",
+    )
+    return [base + pp for base in bases]
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    parts: List[str] = []
+    max_pages = int(env("GOSZAKUP_PDF_MAX_PAGES", "30") or "30")
+    for page in list(reader.pages)[:max_pages]:
+        parts.append(page.extract_text() or "")
+    text = "\n".join(parts)
+    text = text.replace("\u00ad", "").replace("\u200b", "")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    max_chars = int(env("GOSZAKUP_PDF_MAX_CHARS", "24000") or "24000")
+    return text.strip()[:max_chars]
+
+
+def _is_current_tender(t: Tender) -> bool:
+    # Основной критерий — срок ещё не прошёл. Статусы Госзакупа меняются и
+    # могут называться по-разному, поэтому не делаем жёсткую зависимость от текста статуса.
+    end_dt = parse_dt(t.end_date)
+    if end_dt is not None:
+        return end_dt >= datetime.now()
+    low = (t.status or "").lower()
+    return ("прием" in low or "приём" in low or "опублик" in low)
+
+
+def _download_techspec_pdf(t: Tender, token: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    tech = t.techspec if isinstance(t.techspec, dict) else None
+    if not tech:
+        return None, {"reason": "no_techspec"}
+    files = tech.get("files") if isinstance(tech.get("files"), list) else []
+    candidates = [f for f in files if isinstance(f, dict) and f.get("is_techspec")]
+    if not candidates:
+        return None, {"reason": "no_techspec_file"}
+
+    # Если документов несколько, сначала пробуем самые явно похожие на техспецификацию.
+    def score(f: Dict[str, Any]) -> int:
+        blob = " ".join(str(f.get(k) or "").lower() for k in ("name", "original_name", "file_path"))
+        s = 0
+        if "техничес" in blob: s += 10
+        if "спецификац" in blob: s += 10
+        if "techspec" in blob or "tech_spec" in blob: s += 10
+        if ".pdf" in blob: s += 2
+        if "договор" in blob: s -= 5
+        return s
+
+    candidates = sorted(candidates, key=score, reverse=True)
+    headers_variants = [
+        {"Authorization": f"Bearer {token}", "User-Agent": "Tender-Radar-KZ/1.3"},
+        {"User-Agent": "Mozilla/5.0 Tender-Radar-KZ/1.3"},
+    ]
+    last: Dict[str, Any] = {}
+    for f in candidates[:3]:
+        fp = str(f.get("file_path") or "")
+        for url in _url_candidates(fp):
+            for headers in headers_variants:
+                for attempt in range(2):
+                    try:
+                        r = requests.get(url, headers=headers, timeout=(10, 35), allow_redirects=True)
+                        last = {
+                            "url": url,
+                            "status": r.status_code,
+                            "bytes": len(r.content),
+                            "original_name": f.get("original_name"),
+                            "authorized": "Authorization" in headers,
+                        }
+                        if r.ok and _looks_like_pdf(r.content, r.headers.get("content-type", "")):
+                            text = _extract_pdf_text(r.content)
+                            if text:
+                                return text, last
+                    except Exception as e:
+                        last = {"url": url, "error": repr(e), "original_name": f.get("original_name")}
+                    if attempt == 0:
+                        time.sleep(0.4)
+    return None, last or {"reason": "download_failed"}
+
+
+def enrich_pdf_techspec(items: List[Tender], token: str) -> None:
+    """Добавляет настоящий текст PDF в raw.techspec.technical_requirements.
+
+    Обрабатываем только текущие лоты и только те, где GraphQL вернул файл техспеки.
+    Скачивание идёт параллельно, чтобы общий сбор не растягивался на десятки минут.
+    """
+    enabled = env("GOSZAKUP_PDF_TECHSPEC", "1").lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        print("PDF TECHSPEC: disabled")
+        return
+
+    targets = [
+        t for t in items
+        if _is_current_tender(t)
+        and isinstance(t.techspec, dict)
+        and t.techspec.get("has_techspec_file")
+    ]
+    if not targets:
+        print("PDF TECHSPEC: no current targets")
+        return
+
+    workers = max(1, min(int(env("GOSZAKUP_PDF_WORKERS", "6") or "6"), 10))
+    print(f"PDF TECHSPEC: targets={len(targets)} workers={workers}", flush=True)
+
+    ok = 0
+    failed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {pool.submit(_download_techspec_pdf, t, token): t for t in targets}
+        for fut in as_completed(future_map):
+            t = future_map[fut]
+            try:
+                text, info = fut.result()
+            except Exception as e:
+                text, info = None, {"error": repr(e)}
+            tech = t.techspec if isinstance(t.techspec, dict) else {}
+            if text:
+                # ВАЖНО: именно это поле читает карточка Tender Radar.
+                tech["technical_requirements"] = text
+                tech["pdf_extracted"] = True
+                tech["pdf_text_length"] = len(text)
+                tech["pdf_source"] = info.get("url")
+                tech["pdf_original_name"] = info.get("original_name")
+                # Поля товара тоже разбираем уже по настоящей техспецификации.
+                tech["parsed_fields"] = parse_product_fields(text)
+                ok += 1
+                if str(t.external_id) == "87884071" or str(t.lot_number).startswith("87884071"):
+                    low = text.lower()
+                    print(
+                        "PDF CONTROL 87884071:",
+                        "CB435A=", "cb435a" in low,
+                        "1500=", ("1500" in low or "1 500" in low),
+                        "P1005=", "p1005" in low,
+                        "P1006=", "p1006" in low,
+                        "chars=", len(text),
+                        flush=True,
+                    )
+            else:
+                tech["pdf_extracted"] = False
+                tech["pdf_error"] = info
+                failed += 1
+            t.techspec = tech
+
+    print(f"PDF TECHSPEC: extracted={ok} failed={failed}", flush=True)
 
 def normalize(lot: Dict[str, Any], keyword: str) -> Tender:
     buy = lot.get("TrdBuy") or {}
@@ -707,7 +710,7 @@ def main() -> int:
     keywords = load_keywords()
     all_items: List[Tender] = []
 
-    print("ProcureVision KZ — Goszakup Collector v1.2 TECHSPEC RESTORE")
+    print("ProcureVision KZ — Goszakup Collector v1.3 PDF TECHSPEC")
     print("Ключевые слова:", ", ".join(keywords))
 
     for keyword in keywords:
@@ -721,16 +724,12 @@ def main() -> int:
         time.sleep(0.3)
 
     items = deduplicate(all_items)
+    enrich_pdf_techspec(items, token)
     json_path = save_json(items)
     csv_path = save_csv(items)
 
-    try:
-        upload_supabase(items)
-        if env("SUPABASE_URL") and env("SUPABASE_SERVICE_ROLE_KEY"):
-            print("Supabase: данные отправлены.")
-    except Exception as e:
-        print(f"Supabase error: {e}", file=sys.stderr)
-
+    # Supabase синхронизирует auto_collect_and_sync.py. Сам коллектор пишет только JSON/CSV,
+    # чтобы не было второго неполного POST без raw.techspec.
     print(f"Итого уникальных лотов: {len(items)}")
     print(f"JSON: {json_path}")
     print(f"CSV : {csv_path}")
