@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
@@ -94,22 +95,55 @@ def compact(v: Any) -> str:
 
 
 def gql(token: str, variables: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    GraphQL with automatic retry for temporary Goszakup network stalls.
+
+    The endpoint has already shown both ConnectTimeout and ReadTimeout in
+    GitHub Actions, while the same control query succeeds at other times.
+    We therefore retry only transport-level failures; HTTP/GraphQL errors
+    are still surfaced immediately.
+    """
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
-        "User-Agent": "Tender-Radar-KZ-Goszakup-PDF-Test/1.0",
+        "User-Agent": "Tender-Radar-KZ-Goszakup-PDF-Test/1.1-retry",
     }
-    r = requests.post(
-        GRAPHQL_URL,
-        headers=headers,
-        json={"query": QUERY, "variables": variables},
-        timeout=60,
+
+    max_attempts = 4
+    waits = [5, 15, 30]
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"[GraphQL] request attempt {attempt}/{max_attempts}", flush=True)
+            r = requests.post(
+                GRAPHQL_URL,
+                headers=headers,
+                json={"query": QUERY, "variables": variables},
+                timeout=(20, 90),  # connect timeout, read timeout
+            )
+            r.raise_for_status()
+            data = r.json()
+            if data.get("errors"):
+                raise RuntimeError("GraphQL error: " + json.dumps(data["errors"], ensure_ascii=False))
+            print(f"[GraphQL] request attempt {attempt}: OK", flush=True)
+            return data.get("data", {}).get("Lots") or []
+
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError) as e:
+            last_error = e
+            print(f"[GraphQL] temporary network error on attempt {attempt}: {repr(e)}",
+                  file=sys.stderr, flush=True)
+            if attempt < max_attempts:
+                pause = waits[attempt - 1]
+                print(f"[GraphQL] retry in {pause}s", flush=True)
+                time.sleep(pause)
+                continue
+            break
+
+    raise RuntimeError(
+        f"Goszakup GraphQL unavailable after {max_attempts} attempts: {repr(last_error)}"
     )
-    r.raise_for_status()
-    data = r.json()
-    if data.get("errors"):
-        raise RuntimeError("GraphQL error: " + json.dumps(data["errors"], ensure_ascii=False))
-    return data.get("data", {}).get("Lots") or []
 
 
 def find_control_lot(token: str) -> Dict[str, Any]:
@@ -401,9 +435,10 @@ def main() -> int:
     print("\nRESULT JSON:", out, flush=True)
     print("FINAL STATUS:", result.get("stage"), "OK=", result.get("ok"), flush=True)
 
-    # Для диагностики workflow завершаем успешно, если GraphQL отработал,
-    # даже когда URL скачивания ещё надо уточнить. Статус смотрим в JSON/логах.
-    return 0
+    # Control workflow must be green only when the PDF text itself passed
+    # the required marker checks. On network/PDF failure we return non-zero,
+    # so the Supabase PATCH step will not run and cannot hide the real cause.
+    return 0 if result.get("ok") else 1
 
 
 if __name__ == "__main__":
