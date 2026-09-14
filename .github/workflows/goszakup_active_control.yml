@@ -2,6 +2,8 @@ name: Goszakup Active Lot -> Supabase
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'
 
 permissions:
   contents: read
