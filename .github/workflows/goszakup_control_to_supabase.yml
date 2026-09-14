@@ -1,0 +1,181 @@
+name: Goszakup Control Lot -> Supabase
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip requests pypdf
+
+      - name: Extract PDF for control lot
+        env:
+          GOSZAKUP_TOKEN: ${{ secrets.GOSZAKUP_TOKEN }}
+          CONTROL_LOT: "87884071-3ЦП1"
+        run: python -u goszakup_pdf_techspec_test.py
+
+      - name: Patch ONLY control lot raw.techspec in Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          import requests
+
+          root = Path('.')
+          result_path = root / 'output' / 'goszakup_pdf_test_result.json'
+          text_path = root / 'output' / 'goszakup_pdf_test_text.txt'
+
+          if not result_path.exists() or not text_path.exists():
+              raise SystemExit('CONTROL FAIL: diagnostic output is missing')
+
+          result = json.loads(result_path.read_text(encoding='utf-8'))
+          text = text_path.read_text(encoding='utf-8').strip()
+          markers = result.get('markers') or {}
+          core = ['35A', 'CB435A', '1500', 'P1005', 'P1006']
+          missing = [k for k in core if not markers.get(k)]
+          if missing:
+              raise SystemExit('CONTROL FAIL: PDF markers missing: ' + ', '.join(missing))
+
+          lot = result.get('lot') or {}
+          lot_id = str(lot.get('id') or '').strip()
+          lot_number = str(lot.get('lotNumber') or '').strip()
+          if not lot_id:
+              raise SystemExit('CONTROL FAIL: GraphQL lot id is missing')
+
+          base = os.environ['SUPABASE_URL'].rstrip('/')
+          key = os.environ['SUPABASE_SERVICE_ROLE_KEY']
+          endpoint = base + '/rest/v1/tenders'
+          headers = {
+              'apikey': key,
+              'Authorization': 'Bearer ' + key,
+              'Content-Type': 'application/json',
+          }
+
+          def get_rows(params):
+              r = requests.get(endpoint, headers=headers, params=params, timeout=60)
+              r.raise_for_status()
+              return r.json()
+
+          # Normal production key used by auto_collect_and_sync.py is GraphQL lot id.
+          rows = get_rows({
+              'select': 'source_code,source_lot_id,source_tender_id,raw',
+              'source_code': 'eq.goszakup',
+              'source_lot_id': 'eq.' + lot_id,
+              'limit': '1',
+          })
+
+          # Safe fallback for an older row key: search by lot_number inside raw JSON.
+          if not rows and lot_number:
+              rows = get_rows({
+                  'select': 'source_code,source_lot_id,source_tender_id,raw',
+                  'source_code': 'eq.goszakup',
+                  'raw->>lot_number': 'eq.' + lot_number,
+                  'limit': '1',
+              })
+
+          if not rows:
+              raise SystemExit(
+                  f'CONTROL FAIL: existing Supabase row not found for id={lot_id}, lot={lot_number}. '
+                  'Nothing was inserted or changed.'
+              )
+
+          row = rows[0]
+          source_lot_id = str(row.get('source_lot_id') or '').strip()
+          raw = row.get('raw') if isinstance(row.get('raw'), dict) else {}
+          tech = raw.get('techspec') if isinstance(raw.get('techspec'), dict) else {}
+
+          tech_file = result.get('tech_file') or {}
+          tech['technical_requirements'] = text
+          tech['pdf_extracted'] = True
+          tech['pdf_text_length'] = len(text)
+          tech['pdf_source'] = (result.get('pdf_source') or {}).get('final_url') or (result.get('pdf_source') or {}).get('url')
+          tech['pdf_original_name'] = tech_file.get('originalName')
+          tech['pdf_control_markers'] = markers
+          tech['has_techspec_file'] = True
+          raw['techspec'] = tech
+
+          patch_headers = dict(headers)
+          patch_headers['Prefer'] = 'return=representation'
+          patch = requests.patch(
+              endpoint,
+              headers=patch_headers,
+              params={
+                  'source_code': 'eq.goszakup',
+                  'source_lot_id': 'eq.' + source_lot_id,
+              },
+              json={'raw': raw},
+              timeout=60,
+          )
+          patch.raise_for_status()
+          changed = patch.json()
+          if not changed:
+              raise SystemExit('CONTROL FAIL: Supabase PATCH changed 0 rows')
+
+          # Read back and verify the exact field used by Tender Radar card.
+          verify = get_rows({
+              'select': 'source_lot_id,raw',
+              'source_code': 'eq.goszakup',
+              'source_lot_id': 'eq.' + source_lot_id,
+              'limit': '1',
+          })
+          if not verify:
+              raise SystemExit('CONTROL FAIL: row disappeared after PATCH')
+
+          saved = (((verify[0].get('raw') or {}).get('techspec') or {}).get('technical_requirements') or '')
+          low = saved.lower()
+          checks = {
+              'CB435A': 'cb435a' in low,
+              '1500': ('1500' in low or '1 500' in low),
+              'P1005': 'p1005' in low,
+              'P1006': 'p1006' in low,
+          }
+          if not all(checks.values()):
+              raise SystemExit('CONTROL FAIL: Supabase read-back markers incomplete: ' + json.dumps(checks, ensure_ascii=False))
+
+          report = {
+              'ok': True,
+              'source_lot_id': source_lot_id,
+              'lot_number': lot_number,
+              'pdf_text_length': len(saved),
+              'checks': checks,
+              'message': 'API -> PDF -> Supabase PASSED. Only the control lot raw.techspec was changed.',
+          }
+          out = root / 'output' / 'goszakup_control_supabase_result.json'
+          out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          print('\n' + '=' * 72)
+          print('CONTROL PASS: API -> PDF -> SUPABASE')
+          print('LOT:', lot_number, 'DB KEY:', source_lot_id)
+          print('PDF TEXT CHARS:', len(saved))
+          print('MARKERS:', json.dumps(checks, ensure_ascii=False))
+          print('Only this one existing Goszakup row was patched.')
+          print('=' * 72)
+          PY
+
+      - name: Upload control diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goszakup-control-to-supabase
+          path: output/
+          if-no-files-found: warn
