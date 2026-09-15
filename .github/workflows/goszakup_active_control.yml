@@ -31,21 +31,18 @@ jobs:
           CONTROL_LOT: "87872312-ОИ3"
           CONTROL_ANN: "17626528-1"
           EXPECTED_TEXT: "Steri-Gas 3M"
-          CONTROL_FILE_OBJECT_ID: ""
+          CONTROL_FILE_OBJECT_ID: "43249288"
         run: python -u goszakup_active_control.py
 
       - name: Patch ONLY ACTIVE control lot raw.techspec in Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          CONTROL_LOT: "87872312-ОИ3"
-          CONTROL_ANN: "17626528-1"
           EXPECTED_TEXT: "Steri-Gas 3M"
         run: |
           python - <<'PY'
           import json
           import os
-          import re
           from pathlib import Path
           import requests
 
@@ -58,28 +55,20 @@ jobs:
 
           result = json.loads(result_path.read_text(encoding='utf-8'))
           text = text_path.read_text(encoding='utf-8').strip()
+          expected = os.environ.get('EXPECTED_TEXT', '').strip()
 
           if not result.get('ok'):
-              raise SystemExit('ACTIVE CONTROL FAIL: PDF extraction result is not OK')
-
-          expected = os.environ.get('EXPECTED_TEXT', '').strip()
-          if expected and expected.lower() not in text.lower():
-              raise SystemExit(f'ACTIVE CONTROL FAIL: {expected} missing from PDF text')
+              raise SystemExit('ACTIVE CONTROL FAIL: PDF extraction test did not pass')
+          if not expected:
+              raise SystemExit('ACTIVE CONTROL FAIL: EXPECTED_TEXT is empty')
+          if expected.lower() not in text.lower():
+              raise SystemExit('ACTIVE CONTROL FAIL: expected marker missing from PDF text: ' + expected)
 
           lot = result.get('lot') or {}
           lot_id = str(lot.get('id') or '').strip()
           lot_number = str(lot.get('lotNumber') or '').strip()
-          control_lot = os.environ.get('CONTROL_LOT', '').strip()
-          control_ann = os.environ.get('CONTROL_ANN', '').strip()
-
           if not lot_id:
               raise SystemExit('ACTIVE CONTROL FAIL: GraphQL lot id is missing')
-
-          def lot_prefix(value):
-              m = re.search(r'\d{6,}', str(value or ''))
-              return m.group(0) if m else ''
-
-          target_prefix = lot_prefix(control_lot or lot_number)
 
           base = os.environ['SUPABASE_URL'].rstrip('/')
           key = os.environ['SUPABASE_SERVICE_ROLE_KEY']
@@ -95,7 +84,6 @@ jobs:
               r.raise_for_status()
               return r.json()
 
-          # Primary production key: GraphQL lot id.
           rows = get_rows({
               'select': 'source_code,source_lot_id,source_tender_id,raw',
               'source_code': 'eq.goszakup',
@@ -103,24 +91,6 @@ jobs:
               'limit': '1',
           })
 
-          # Robust fallback: same announcement, then select by numeric lot prefix.
-          if not rows and control_ann:
-              candidates = get_rows({
-                  'select': 'source_code,source_lot_id,source_tender_id,raw',
-                  'source_code': 'eq.goszakup',
-                  'source_tender_id': 'eq.' + control_ann,
-                  'limit': '100',
-              })
-              matched = []
-              for row in candidates:
-                  raw = row.get('raw') if isinstance(row.get('raw'), dict) else {}
-                  raw_lot = raw.get('lot_number') or raw.get('lotNumber') or ''
-                  if target_prefix and lot_prefix(raw_lot) == target_prefix:
-                      matched.append(row)
-              if matched:
-                  rows = [matched[0]]
-
-          # Older-row fallback: exact lot number stored inside raw JSON.
           if not rows and lot_number:
               rows = get_rows({
                   'select': 'source_code,source_lot_id,source_tender_id,raw',
@@ -130,28 +100,20 @@ jobs:
               })
 
           if not rows:
-              raise SystemExit(
-                  f'ACTIVE CONTROL FAIL: existing Supabase row not found for '
-                  f'id={lot_id}, lot={lot_number}, announcement={control_ann}. '
-                  'Nothing was inserted or changed.'
-              )
+              raise SystemExit('ACTIVE CONTROL FAIL: active lot row not found in Supabase')
 
           row = rows[0]
           source_lot_id = str(row.get('source_lot_id') or '').strip()
           raw = row.get('raw') if isinstance(row.get('raw'), dict) else {}
           tech = raw.get('techspec') if isinstance(raw.get('techspec'), dict) else {}
-
           tech_file = result.get('tech_file') or {}
-          verification = result.get('verification') or {}
-          pdf_source = result.get('pdf_source') or {}
 
           tech['technical_requirements'] = text
           tech['pdf_extracted'] = True
           tech['pdf_text_length'] = len(text)
-          tech['pdf_source'] = pdf_source.get('final_url') or pdf_source.get('url')
+          tech['pdf_source'] = (result.get('pdf_source') or {}).get('final_url') or (result.get('pdf_source') or {}).get('url')
           tech['pdf_original_name'] = tech_file.get('originalName')
-          tech['pdf_object_id'] = tech_file.get('objectId')
-          tech['pdf_control_markers'] = verification
+          tech['pdf_active_control'] = True
           tech['has_techspec_file'] = True
           raw['techspec'] = tech
 
@@ -160,14 +122,12 @@ jobs:
           patch = requests.patch(
               endpoint,
               headers=patch_headers,
-              params={
-                  'source_code': 'eq.goszakup',
-                  'source_lot_id': 'eq.' + source_lot_id,
-              },
+              params={'source_code': 'eq.goszakup', 'source_lot_id': 'eq.' + source_lot_id},
               json={'raw': raw},
               timeout=60,
           )
           patch.raise_for_status()
+
           changed = patch.json()
           if not changed:
               raise SystemExit('ACTIVE CONTROL FAIL: Supabase PATCH changed 0 rows')
@@ -182,32 +142,18 @@ jobs:
               raise SystemExit('ACTIVE CONTROL FAIL: row disappeared after PATCH')
 
           saved = (((verify[0].get('raw') or {}).get('techspec') or {}).get('technical_requirements') or '')
-          if expected and expected.lower() not in saved.lower():
-              raise SystemExit(
-                  f'ACTIVE CONTROL FAIL: Supabase read-back does not contain {expected}'
-              )
+          if expected.lower() not in saved.lower():
+              raise SystemExit('ACTIVE CONTROL FAIL: Supabase read-back does not contain: ' + expected)
 
-          report = {
-              'ok': True,
-              'source_lot_id': source_lot_id,
-              'lot_number': lot_number,
-              'announcement': control_ann,
-              'expected_text': expected,
-              'pdf_text_length': len(saved),
-              'pdf_original_name': tech_file.get('originalName'),
-              'pdf_object_id': tech_file.get('objectId'),
-              'message': 'API -> PDF -> Supabase PASSED. Only the active control lot raw.techspec was changed.',
-          }
-          out = root / 'output_active_control' / 'active_control_supabase_result.json'
-          out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-
-          print('\n' + '=' * 72)
+          print()
+          print('=' * 72)
           print('ACTIVE CONTROL PASS: API -> PDF -> SUPABASE')
+          print('=' * 72)
           print('LOT:', lot_number, 'DB KEY:', source_lot_id)
-          print('ANNOUNCEMENT:', control_ann)
+          print('ANNOUNCEMENT:', result.get('control_announcement'))
           print('EXPECTED:', expected, 'FOUND=True')
           print('PDF:', tech_file.get('originalName'), 'objectId=', tech_file.get('objectId'))
-          print('PDF TEXT CHARS:', len(saved))
+          print('PDF TEXT CHARS:', len(text))
           print('Only this one existing Goszakup row was patched.')
           print('=' * 72)
           PY
@@ -216,6 +162,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: goszakup-active-control
+          name: goszakup-active-control-diagnostics
           path: output_active_control/
           if-no-files-found: warn
