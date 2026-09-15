@@ -28,19 +28,19 @@ jobs:
       - name: Extract PDF for ACTIVE control lot
         env:
           GOSZAKUP_TOKEN: ${{ secrets.GOSZAKUP_TOKEN }}
-          CONTROL_LOT: "87873972-3ЦП1"
-          CONTROL_ANN: "17606578-1"
-          EXPECTED_TEXT: "W2072A"
-          CONTROL_FILE_OBJECT_ID: "43204813"
+          CONTROL_LOT: "87872312-ОИ3"
+          CONTROL_ANN: "17626528-1"
+          EXPECTED_TEXT: "Steri-Gas 3M"
+          CONTROL_FILE_OBJECT_ID: ""
         run: python -u goszakup_active_control.py
 
       - name: Patch ONLY ACTIVE control lot raw.techspec in Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          CONTROL_LOT: "87873972-3ЦП1"
-          CONTROL_ANN: "17606578-1"
-          EXPECTED_TEXT: "W2072A"
+          CONTROL_LOT: "87872312-ОИ3"
+          CONTROL_ANN: "17626528-1"
+          EXPECTED_TEXT: "Steri-Gas 3M"
         run: |
           python - <<'PY'
           import json
