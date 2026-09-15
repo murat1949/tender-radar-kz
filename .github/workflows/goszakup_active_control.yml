@@ -30,40 +30,38 @@ jobs:
           GOSZAKUP_TOKEN: ${{ secrets.GOSZAKUP_TOKEN }}
           CONTROL_LOT: "87872312-ОИ3"
           CONTROL_ANN: "17626528-1"
-          EXPECTED_TEXT: "Steri-Gas 3M"
+          CONTROL_FILE_OBJECT_ID: "43249288"
         run: python -u goszakup_active_control.py
 
       - name: Patch ONLY ACTIVE control lot raw.techspec in Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          EXPECTED_TEXT: "Steri-Gas 3M"
         run: |
           python - <<'PY'
+          import hashlib
           import json
           import os
           from pathlib import Path
           import requests
 
-          result_path = Path('output_active_control/active_control_result.json')
-          text_path = Path('output_active_control/active_control_text.txt')
+          root = Path('.')
+          result_path = root / 'output_active_control' / 'active_control_result.json'
+          text_path = root / 'output_active_control' / 'active_control_text.txt'
 
           if not result_path.exists() or not text_path.exists():
               raise SystemExit('ACTIVE CONTROL FAIL: diagnostic output is missing')
 
           result = json.loads(result_path.read_text(encoding='utf-8'))
           text = text_path.read_text(encoding='utf-8').strip()
-          expected = os.environ.get('EXPECTED_TEXT', '').strip()
+          checks = result.get('verification') or {}
 
           if not result.get('ok'):
               raise SystemExit('ACTIVE CONTROL FAIL: PDF extraction did not pass')
-          if expected and expected.lower() not in text.lower():
-              # The Python extractor already performs punctuation-tolerant verification.
-              # Here we only guard against an empty/wrong output file.
-              compact_saved = ''.join(ch.lower() for ch in text if ch.isalnum())
-              compact_expected = ''.join(ch.lower() for ch in expected if ch.isalnum())
-              if compact_expected not in compact_saved:
-                  raise SystemExit('ACTIVE CONTROL FAIL: expected marker missing from extracted text')
+          if not checks.get('announcement') or not checks.get('lot_prefix'):
+              raise SystemExit('ACTIVE CONTROL FAIL: PDF identity verification failed')
+          if len(text) < 50:
+              raise SystemExit('ACTIVE CONTROL FAIL: extracted PDF text is unexpectedly short')
 
           lot = result.get('lot') or {}
           lot_id = str(lot.get('id') or '').strip()
@@ -101,21 +99,26 @@ jobs:
               })
 
           if not rows:
-              raise SystemExit('ACTIVE CONTROL FAIL: target lot row not found in Supabase')
+              raise SystemExit('ACTIVE CONTROL FAIL: active lot row not found in Supabase')
 
           row = rows[0]
           source_lot_id = str(row.get('source_lot_id') or '').strip()
           raw = row.get('raw') if isinstance(row.get('raw'), dict) else {}
           tech = raw.get('techspec') if isinstance(raw.get('techspec'), dict) else {}
           tech_file = result.get('tech_file') or {}
-          pdf_source = result.get('pdf_source') or {}
+          text_sha256 = hashlib.sha256(text.encode('utf-8')).hexdigest()
 
           tech['technical_requirements'] = text
           tech['pdf_extracted'] = True
           tech['pdf_text_length'] = len(text)
-          tech['pdf_source'] = pdf_source.get('final_url') or pdf_source.get('url')
+          tech['pdf_text_sha256'] = text_sha256
+          tech['pdf_source'] = (
+              (result.get('pdf_source') or {}).get('final_url')
+              or (result.get('pdf_source') or {}).get('url')
+          )
           tech['pdf_original_name'] = tech_file.get('originalName')
           tech['pdf_object_id'] = tech_file.get('objectId')
+          tech['pdf_verification'] = checks
           tech['pdf_active_control'] = True
           tech['has_techspec_file'] = True
           raw['techspec'] = tech
@@ -125,14 +128,20 @@ jobs:
           patch = requests.patch(
               endpoint,
               headers=patch_headers,
-              params={'source_code': 'eq.goszakup', 'source_lot_id': 'eq.' + source_lot_id},
+              params={
+                  'source_code': 'eq.goszakup',
+                  'source_lot_id': 'eq.' + source_lot_id,
+              },
               json={'raw': raw},
               timeout=60,
           )
           patch.raise_for_status()
+
           changed = patch.json()
           if len(changed) != 1:
-              raise SystemExit(f'ACTIVE CONTROL FAIL: expected exactly 1 patched row, got {len(changed)}')
+              raise SystemExit(
+                  'ACTIVE CONTROL FAIL: expected exactly 1 patched row, got ' + str(len(changed))
+              )
 
           verify = get_rows({
               'select': 'source_lot_id,raw',
@@ -141,11 +150,15 @@ jobs:
               'limit': '1',
           })
           if not verify:
-              raise SystemExit('ACTIVE CONTROL FAIL: row missing after PATCH')
+              raise SystemExit('ACTIVE CONTROL FAIL: row disappeared after PATCH')
 
-          saved = (((verify[0].get('raw') or {}).get('techspec') or {}).get('technical_requirements') or '')
-          if saved != text:
-              raise SystemExit('ACTIVE CONTROL FAIL: Supabase read-back differs from extracted PDF text')
+          saved = (
+              ((verify[0].get('raw') or {}).get('techspec') or {})
+              .get('technical_requirements') or ''
+          ).strip()
+          saved_sha256 = hashlib.sha256(saved.encode('utf-8')).hexdigest()
+          if saved_sha256 != text_sha256:
+              raise SystemExit('ACTIVE CONTROL FAIL: Supabase read-back differs from PDF text')
 
           print()
           print('=' * 72)
@@ -153,11 +166,12 @@ jobs:
           print('=' * 72)
           print('LOT:', lot_number, 'DB KEY:', source_lot_id)
           print('ANNOUNCEMENT:', result.get('control_announcement'))
-          if expected:
-              print('EXPECTED:', expected, 'FOUND=True')
+          print('PDF IDENTITY: announcement=True lot_prefix=True')
           print('PDF:', tech_file.get('originalName'), 'objectId=', tech_file.get('objectId'))
           print('PDF TEXT CHARS:', len(text))
-          print('Exactly one existing Goszakup row was patched and verified.')
+          print('PDF TEXT SHA256:', text_sha256)
+          print('SUPABASE READ-BACK SHA256 MATCH=True')
+          print('Only this one existing Goszakup row was patched.')
           print('=' * 72)
           PY
 
