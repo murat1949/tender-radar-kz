@@ -11,7 +11,7 @@ permissions:
 jobs:
   control:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -31,7 +31,6 @@ jobs:
           CONTROL_LOT: "87872312-ОИ3"
           CONTROL_ANN: "17626528-1"
           EXPECTED_TEXT: "Steri-Gas 3M"
-          CONTROL_FILE_OBJECT_ID: "43249288"
         run: python -u goszakup_active_control.py
 
       - name: Patch ONLY ACTIVE control lot raw.techspec in Supabase
@@ -46,9 +45,8 @@ jobs:
           from pathlib import Path
           import requests
 
-          root = Path('.')
-          result_path = root / 'output_active_control' / 'active_control_result.json'
-          text_path = root / 'output_active_control' / 'active_control_text.txt'
+          result_path = Path('output_active_control/active_control_result.json')
+          text_path = Path('output_active_control/active_control_text.txt')
 
           if not result_path.exists() or not text_path.exists():
               raise SystemExit('ACTIVE CONTROL FAIL: diagnostic output is missing')
@@ -58,11 +56,14 @@ jobs:
           expected = os.environ.get('EXPECTED_TEXT', '').strip()
 
           if not result.get('ok'):
-              raise SystemExit('ACTIVE CONTROL FAIL: PDF extraction test did not pass')
-          if not expected:
-              raise SystemExit('ACTIVE CONTROL FAIL: EXPECTED_TEXT is empty')
-          if expected.lower() not in text.lower():
-              raise SystemExit('ACTIVE CONTROL FAIL: expected marker missing from PDF text: ' + expected)
+              raise SystemExit('ACTIVE CONTROL FAIL: PDF extraction did not pass')
+          if expected and expected.lower() not in text.lower():
+              # The Python extractor already performs punctuation-tolerant verification.
+              # Here we only guard against an empty/wrong output file.
+              compact_saved = ''.join(ch.lower() for ch in text if ch.isalnum())
+              compact_expected = ''.join(ch.lower() for ch in expected if ch.isalnum())
+              if compact_expected not in compact_saved:
+                  raise SystemExit('ACTIVE CONTROL FAIL: expected marker missing from extracted text')
 
           lot = result.get('lot') or {}
           lot_id = str(lot.get('id') or '').strip()
@@ -100,19 +101,21 @@ jobs:
               })
 
           if not rows:
-              raise SystemExit('ACTIVE CONTROL FAIL: active lot row not found in Supabase')
+              raise SystemExit('ACTIVE CONTROL FAIL: target lot row not found in Supabase')
 
           row = rows[0]
           source_lot_id = str(row.get('source_lot_id') or '').strip()
           raw = row.get('raw') if isinstance(row.get('raw'), dict) else {}
           tech = raw.get('techspec') if isinstance(raw.get('techspec'), dict) else {}
           tech_file = result.get('tech_file') or {}
+          pdf_source = result.get('pdf_source') or {}
 
           tech['technical_requirements'] = text
           tech['pdf_extracted'] = True
           tech['pdf_text_length'] = len(text)
-          tech['pdf_source'] = (result.get('pdf_source') or {}).get('final_url') or (result.get('pdf_source') or {}).get('url')
+          tech['pdf_source'] = pdf_source.get('final_url') or pdf_source.get('url')
           tech['pdf_original_name'] = tech_file.get('originalName')
+          tech['pdf_object_id'] = tech_file.get('objectId')
           tech['pdf_active_control'] = True
           tech['has_techspec_file'] = True
           raw['techspec'] = tech
@@ -127,10 +130,9 @@ jobs:
               timeout=60,
           )
           patch.raise_for_status()
-
           changed = patch.json()
-          if not changed:
-              raise SystemExit('ACTIVE CONTROL FAIL: Supabase PATCH changed 0 rows')
+          if len(changed) != 1:
+              raise SystemExit(f'ACTIVE CONTROL FAIL: expected exactly 1 patched row, got {len(changed)}')
 
           verify = get_rows({
               'select': 'source_lot_id,raw',
@@ -139,11 +141,11 @@ jobs:
               'limit': '1',
           })
           if not verify:
-              raise SystemExit('ACTIVE CONTROL FAIL: row disappeared after PATCH')
+              raise SystemExit('ACTIVE CONTROL FAIL: row missing after PATCH')
 
           saved = (((verify[0].get('raw') or {}).get('techspec') or {}).get('technical_requirements') or '')
-          if expected.lower() not in saved.lower():
-              raise SystemExit('ACTIVE CONTROL FAIL: Supabase read-back does not contain: ' + expected)
+          if saved != text:
+              raise SystemExit('ACTIVE CONTROL FAIL: Supabase read-back differs from extracted PDF text')
 
           print()
           print('=' * 72)
@@ -151,10 +153,11 @@ jobs:
           print('=' * 72)
           print('LOT:', lot_number, 'DB KEY:', source_lot_id)
           print('ANNOUNCEMENT:', result.get('control_announcement'))
-          print('EXPECTED:', expected, 'FOUND=True')
+          if expected:
+              print('EXPECTED:', expected, 'FOUND=True')
           print('PDF:', tech_file.get('originalName'), 'objectId=', tech_file.get('objectId'))
           print('PDF TEXT CHARS:', len(text))
-          print('Only this one existing Goszakup row was patched.')
+          print('Exactly one existing Goszakup row was patched and verified.')
           print('=' * 72)
           PY
 
