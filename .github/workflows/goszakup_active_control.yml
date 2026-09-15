@@ -28,9 +28,9 @@ jobs:
       - name: Extract PDF for ACTIVE control lot
         env:
           GOSZAKUP_TOKEN: ${{ secrets.GOSZAKUP_TOKEN }}
-          CONTROL_LOT: "87888776-3ЦП1"
-          CONTROL_ANN: "17602864-1"
-          EXPECTED_TEXT: "LaserJet P1102"
+         CONTROL_LOT: "87873972-3ЦП1"
+        CONTROL_ANN: "17606578-1"
+        EXPECTED_TEXT: "W2072A"
         run: python -u goszakup_active_control.py
 
       - name: Patch ONLY ACTIVE control lot raw.techspec in Supabase
@@ -55,8 +55,8 @@ jobs:
 
           if not result.get('ok'):
               raise SystemExit('ACTIVE CONTROL FAIL: PDF extraction test did not pass')
-          if 'laserjet p1102' not in text.lower():
-              raise SystemExit('ACTIVE CONTROL FAIL: LaserJet P1102 missing from PDF text')
+          if 'w2072a' not in text.lower():
+           raise SystemExit('ACTIVE CONTROL FAIL: W2072A missing from PDF text')
 
           lot = result.get('lot') or {}
           lot_id = str(lot.get('id') or '').strip()
@@ -136,9 +136,8 @@ jobs:
               raise SystemExit('ACTIVE CONTROL FAIL: row disappeared after PATCH')
 
           saved = (((verify[0].get('raw') or {}).get('techspec') or {}).get('technical_requirements') or '')
-          if 'laserjet p1102' not in saved.lower():
-              raise SystemExit('ACTIVE CONTROL FAIL: Supabase read-back does not contain LaserJet P1102')
-
+          if 'w2072a' not in saved.lower():
+           raise SystemExit('ACTIVE CONTROL FAIL: Supabase read-back does not contain W2072A')
           print()
           print('=' * 72)
           print('ACTIVE CONTROL PASS: API -> PDF -> SUPABASE')
