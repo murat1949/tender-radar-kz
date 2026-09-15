@@ -24,7 +24,6 @@ jobs:
 
       - name: Install dependencies
         run: python -m pip install --upgrade pip requests pypdf
-
       - name: Extract PDF for ACTIVE control lot
         env:
           GOSZAKUP_TOKEN: ${{ secrets.GOSZAKUP_TOKEN }}
