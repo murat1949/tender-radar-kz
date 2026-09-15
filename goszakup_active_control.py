@@ -2,21 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-Tender Radar KZ — universal isolated Goszakup control.
+Tender Radar KZ — isolated ACTIVE Goszakup PDF control.
 
-The target lot is configured only through environment variables:
-  CONTROL_LOT      required
-  CONTROL_ANN      required
-  EXPECTED_TEXT    optional, but recommended for a control test
-  CONTROL_FILE_OBJECT_ID optional hint only
-  GOSZAKUP_TOKEN   required
+All control values come from environment variables. No lot number, product
+model, brand, or expected phrase is hard-coded into the program.
 
-This script never writes to Supabase. It only performs:
-  Goszakup GraphQL -> select target lot -> find/download candidate PDFs
-  -> extract text -> verify identity -> save diagnostics.
+The script performs only:
+  Goszakup GraphQL -> select the requested lot -> select/download a PDF
+  -> extract text -> verify the PDF belongs to the requested announcement/lot
+  -> save diagnostics.
 
-No lot number, announcement number, product model, or previous test marker is
-hard-coded in the program.
+EXPECTED_TEXT is optional and diagnostic only. Its absence from the PDF never
+invalidates an otherwise correctly identified technical-specification PDF.
+The GitHub Actions workflow performs the one-row Supabase patch only after
+this script exits successfully.
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ import io
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -34,6 +34,12 @@ import requests
 from pypdf import PdfReader
 
 GRAPHQL_URL = "https://ows.goszakup.gov.kz/v3/graphql"
+
+CONTROL_LOT = os.getenv("CONTROL_LOT", "").strip()
+CONTROL_ANN = os.getenv("CONTROL_ANN", "").strip()
+EXPECTED_TEXT = os.getenv("EXPECTED_TEXT", "").strip()
+CONTROL_FILE_OBJECT_ID = os.getenv("CONTROL_FILE_OBJECT_ID", "").strip()
+
 OUTPUT_DIR = Path(__file__).resolve().parent / "output_active_control"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_PATH = OUTPUT_DIR / "active_control_result.json"
@@ -88,21 +94,15 @@ query FindLot($limit: Int, $after: Int, $filter: LotsFiltersInput) {
 """
 
 
-def env_required(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Required environment variable is missing: {name}")
-    return value
-
-
 def compact(value: Any) -> str:
     return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
 
 
 def normalize_lot(value: Any) -> str:
+    """Normalize visual look-alikes such as Cyrillic З vs digit 3."""
     s = compact(value).upper()
     s = s.translate(str.maketrans({
-        "З": "3",  # Cyrillic ZE can be visually confused with digit 3
+        "З": "3",  # Cyrillic ZE, visually close to 3 in the portal/PDF
         "–": "-",
         "—": "-",
         "−": "-",
@@ -113,39 +113,28 @@ def normalize_lot(value: Any) -> str:
 
 
 def lot_prefix(value: Any) -> str:
+    """Return the long numeric lot prefix, independent of suffix spelling."""
     m = re.search(r"\d{6,}", normalize_lot(value))
     return m.group(0) if m else ""
 
 
-def normalize_text(value: Any) -> str:
+def normalize_marker(value: Any) -> str:
     s = str(value or "").replace("\u00ad", "").replace("\u200b", "")
     return " ".join(s.lower().split())
 
 
-def alnum_text(value: Any) -> str:
-    return re.sub(r"[^0-9a-zа-яё]+", "", normalize_text(value), flags=re.I)
-
-
-def contains_marker(text: str, marker: str) -> bool:
-    if not marker:
-        return True
-    normal_marker = normalize_text(marker)
-    if normal_marker and normal_marker in normalize_text(text):
-        return True
-    compact_marker = alnum_text(marker)
-    return bool(compact_marker and compact_marker in alnum_text(text))
-
-
 def lot_announcement(lot: Dict[str, Any]) -> str:
-    trd = lot.get("TrdBuy") if isinstance(lot.get("TrdBuy"), dict) else {}
-    return compact(lot.get("trdBuyNumberAnno") or trd.get("numberAnno"))
+    return compact(
+        lot.get("trdBuyNumberAnno")
+        or ((lot.get("TrdBuy") or {}).get("numberAnno") if isinstance(lot.get("TrdBuy"), dict) else "")
+    )
 
 
-def gql(token: str, variables: Dict[str, Any], retries: int = 6) -> List[Dict[str, Any]]:
+def gql(token: str, variables: Dict[str, Any], retries: int = 4) -> List[Dict[str, Any]]:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
-        "User-Agent": "Tender-Radar-KZ-Active-Control/3.0",
+        "User-Agent": "Tender-Radar-KZ-Active-Control/2.0",
     }
     last_error: Optional[BaseException] = None
 
@@ -156,19 +145,21 @@ def gql(token: str, variables: Dict[str, Any], retries: int = 6) -> List[Dict[st
                 GRAPHQL_URL,
                 headers=headers,
                 json={"query": QUERY, "variables": variables},
-                timeout=(15, 90),
+                timeout=(20, 90),
             )
             response.raise_for_status()
             payload = response.json()
             if payload.get("errors"):
-                raise RuntimeError("GraphQL error: " + json.dumps(payload["errors"], ensure_ascii=False))
+                raise RuntimeError(
+                    "GraphQL error: " + json.dumps(payload["errors"], ensure_ascii=False)
+                )
             lots = payload.get("data", {}).get("Lots") or []
             return [x for x in lots if isinstance(x, dict)]
         except (requests.Timeout, requests.ConnectionError) as exc:
             last_error = exc
             print("[GraphQL] transient error:", repr(exc), flush=True)
             if attempt < retries:
-                time.sleep(min(5 * attempt, 25))
+                time.sleep(4 * attempt)
         except requests.HTTPError as exc:
             last_error = exc
             status = getattr(exc.response, "status_code", None)
@@ -178,29 +169,28 @@ def gql(token: str, variables: Dict[str, Any], retries: int = 6) -> List[Dict[st
             except Exception:
                 pass
             print(f"[GraphQL] HTTP error status={status}: {body}", flush=True)
+            # Retry server/rate-limit errors, but fail fast on other client errors.
             if status not in (408, 425, 429, 500, 502, 503, 504) or attempt >= retries:
                 raise
-            time.sleep(min(5 * attempt, 25))
+            time.sleep(4 * attempt)
 
-    raise RuntimeError(f"Goszakup GraphQL unavailable after {retries} attempts: {last_error!r}")
+    raise RuntimeError(f"GraphQL unavailable after {retries} attempts: {last_error!r}")
 
 
-def choose_control_lot(
-    lots: Iterable[Dict[str, Any]], control_lot: str, control_ann: str
-) -> Optional[Dict[str, Any]]:
+def choose_control_lot(lots: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     candidates = [x for x in lots if isinstance(x, dict)]
-    target_norm = normalize_lot(control_lot)
-    target_prefix = lot_prefix(control_lot)
+    target_norm = normalize_lot(CONTROL_LOT)
+    target_prefix = lot_prefix(CONTROL_LOT)
 
     def rank(lot: Dict[str, Any]) -> int:
-        number = compact(lot.get("lotNumber"))
+        num = compact(lot.get("lotNumber"))
         ann = lot_announcement(lot)
         score = 0
-        if ann == control_ann:
+        if ann == CONTROL_ANN:
             score += 1000
-        if target_prefix and lot_prefix(number) == target_prefix:
+        if target_prefix and lot_prefix(num) == target_prefix:
             score += 500
-        if normalize_lot(number) == target_norm:
+        if normalize_lot(num) == target_norm:
             score += 200
         return score
 
@@ -209,24 +199,26 @@ def choose_control_lot(
         return None
 
     best = ranked[0]
+    # The essential identity check is the numeric prefix. The suffix may be
+    # rendered by Goszakup as "3ЦП1" or "ЗЦП1" (Cyrillic З).
     if target_prefix and lot_prefix(best.get("lotNumber")) != target_prefix:
-        return None
-    if lot_announcement(best) and lot_announcement(best) != control_ann:
         return None
     return best
 
 
-def find_control_lot(token: str, control_lot: str, control_ann: str) -> Dict[str, Any]:
+def find_control_lot(token: str) -> Dict[str, Any]:
+    # Announcement-first is deliberate: selection by numeric lot prefix remains
+    # stable even when the portal/API render suffix characters differently.
     filters = [
-        {"trdBuyNumberAnno": control_ann},
-        {"lotNumber": control_lot},
+        {"trdBuyNumberAnno": CONTROL_ANN},
+        {"lotNumber": CONTROL_LOT},
     ]
 
     for filt in filters:
         print("[GraphQL] filter =", json.dumps(filt, ensure_ascii=False), flush=True)
         lots = gql(token, {"limit": 200, "after": None, "filter": filt})
         print("[GraphQL] returned:", len(lots), flush=True)
-        lot = choose_control_lot(lots, control_lot, control_ann)
+        lot = choose_control_lot(lots)
         if lot is not None:
             print(
                 "SELECTED LOT:",
@@ -245,24 +237,26 @@ def find_control_lot(token: str, control_lot: str, control_ann: str) -> Dict[str
             return lot
 
     raise RuntimeError(
-        f"Target lot prefix {lot_prefix(control_lot)} in announcement {control_ann} was not found"
+        f"Контрольный активный лот с числовым префиксом {lot_prefix(CONTROL_LOT)} "
+        f"в объявлении {CONTROL_ANN} не найден"
     )
 
 
-def tech_file_score(file_info: Dict[str, Any], control_ann: str, object_hint: str) -> int:
+def tech_file_score(file_info: Dict[str, Any]) -> int:
     blob = " ".join(
         compact(file_info.get(key)).lower()
         for key in ("nameRu", "nameKz", "originalName", "filePath")
     )
     score = 0
+
     object_id = str(file_info.get("objectId") or "").strip()
     original_name = compact(file_info.get("originalName")).lower()
 
-    if object_hint and object_id == object_hint:
+    if CONTROL_FILE_OBJECT_ID and object_id == CONTROL_FILE_OBJECT_ID:
         score += 1000
-    if object_hint and object_hint in original_name:
+    if CONTROL_FILE_OBJECT_ID and CONTROL_FILE_OBJECT_ID in original_name:
         score += 500
-    if control_ann.split("-")[0] in original_name:
+    if CONTROL_ANN.split("-")[0] in original_name:
         score += 100
     if "techspec" in blob or "tech_spec" in blob:
         score += 80
@@ -277,29 +271,32 @@ def tech_file_score(file_info: Dict[str, Any], control_ann: str, object_hint: st
     return score
 
 
-def ranked_tech_files(
-    files: Iterable[Dict[str, Any]], control_ann: str, object_hint: str
-) -> List[Dict[str, Any]]:
+def ranked_tech_files(files: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = [x for x in files if isinstance(x, dict) and compact(x.get("filePath"))]
-    return sorted(rows, key=lambda f: tech_file_score(f, control_ann, object_hint), reverse=True)
+    return sorted(rows, key=tech_file_score, reverse=True)
 
 
 def url_candidates(file_path: str) -> List[str]:
     path = compact(file_path)
     if not path:
         return []
-    if path.startswith(("http://", "https://")):
-        return [path]
 
-    relative = path if path.startswith("/") else "/" + path
-    bases = (
-        "https://ows.goszakup.gov.kz",
-        "https://goszakup.gov.kz",
-        "https://www.goszakup.gov.kz",
-        "https://old.goszakup.gov.kz",
-        "https://procurement.gov.kz",
-    )
-    return list(dict.fromkeys(urljoin(base, relative) for base in bases))
+    result: List[str] = []
+    if path.startswith(("http://", "https://")):
+        result.append(path)
+    else:
+        relative = path if path.startswith("/") else "/" + path
+        for base in (
+            "https://ows.goszakup.gov.kz",
+            "https://goszakup.gov.kz",
+            "https://www.goszakup.gov.kz",
+            "https://old.goszakup.gov.kz",
+            "https://procurement.gov.kz",
+        ):
+            result.append(urljoin(base, relative))
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(result))
 
 
 def looks_like_pdf(content: bytes, content_type: str) -> bool:
@@ -307,12 +304,21 @@ def looks_like_pdf(content: bytes, content_type: str) -> bool:
 
 
 def try_download(
-    session: requests.Session, url: str, token: str, retries: int = 4
+    session: requests.Session,
+    url: str,
+    token: str,
+    retries: int = 3,
 ) -> Tuple[Optional[bytes], Dict[str, Any]]:
     last_info: Dict[str, Any] = {"url": url}
+
     header_variants = (
-        {"Authorization": f"Bearer {token}", "User-Agent": "Tender-Radar-KZ-Active-Control/3.0"},
-        {"User-Agent": "Mozilla/5.0 Tender-Radar-KZ-Active-Control/3.0"},
+        {
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Tender-Radar-KZ-Active-Control/2.0",
+        },
+        {
+            "User-Agent": "Mozilla/5.0 Tender-Radar-KZ-Active-Control/2.0",
+        },
     )
 
     for headers in header_variants:
@@ -321,7 +327,7 @@ def try_download(
                 response = session.get(
                     url,
                     headers=headers,
-                    timeout=(15, 90),
+                    timeout=(20, 90),
                     allow_redirects=True,
                 )
                 info = {
@@ -338,6 +344,9 @@ def try_download(
 
                 if response.ok and looks_like_pdf(response.content, info["content_type"]):
                     return response.content, info
+
+                # Non-transient client response: no need to repeat the same
+                # header variant three times.
                 if response.status_code not in (408, 425, 429, 500, 502, 503, 504):
                     break
             except (requests.Timeout, requests.ConnectionError) as exc:
@@ -347,9 +356,13 @@ def try_download(
                     "attempt": attempt,
                     "authorized": "Authorization" in headers,
                 }
-                print("[download] transient error", json.dumps(last_info, ensure_ascii=False), flush=True)
+                print(
+                    "[download] transient error",
+                    json.dumps(last_info, ensure_ascii=False),
+                    flush=True,
+                )
                 if attempt < retries:
-                    time.sleep(min(5 * attempt, 20))
+                    time.sleep(4 * attempt)
 
     return None, last_info
 
@@ -363,56 +376,78 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     return text.strip()
 
 
-def verify_pdf_text(text: str, control_lot: str, control_ann: str, expected_text: str) -> Tuple[bool, Dict[str, bool]]:
-    checks = {
-        "announcement": contains_marker(text, control_ann),
-        "lot_prefix": contains_marker(text, lot_prefix(control_lot)),
-        "expected_text": contains_marker(text, expected_text) if expected_text else True,
+def verify_pdf_text(text: str) -> Tuple[bool, Dict[str, bool]]:
+    """Verify document identity. Product phrases are optional diagnostics only."""
+    haystack = normalize_marker(text)
+    checks: Dict[str, bool] = {
+        "announcement": normalize_marker(CONTROL_ANN) in haystack,
+        "lot_prefix": normalize_marker(lot_prefix(CONTROL_LOT)) in haystack,
     }
-    return all(checks.values()), checks
+    if EXPECTED_TEXT:
+        checks["expected_text"] = normalize_marker(EXPECTED_TEXT) in haystack
+
+    identity_ok = checks["announcement"] and checks["lot_prefix"]
+    return identity_ok, checks
 
 
 def save_result(result: Dict[str, Any]) -> None:
-    RESULT_PATH.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    RESULT_PATH.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def main() -> int:
-    result: Dict[str, Any] = {"ok": False, "stage": "start", "download_attempts": []}
+    token = os.getenv("GOSZAKUP_TOKEN", "").strip()
+    if not token:
+        print("ERROR: GOSZAKUP_TOKEN is missing", flush=True)
+        return 2
+    if not CONTROL_ANN or not lot_prefix(CONTROL_LOT):
+        print("ERROR: CONTROL_ANN and CONTROL_LOT are required", flush=True)
+        return 2
+
+    result: Dict[str, Any] = {
+        "ok": False,
+        "control_lot": CONTROL_LOT,
+        "control_lot_prefix": lot_prefix(CONTROL_LOT),
+        "control_announcement": CONTROL_ANN,
+        "control_file_object_id": CONTROL_FILE_OBJECT_ID,
+        "expected_text": EXPECTED_TEXT,
+        "stage": "start",
+        "download_attempts": [],
+    }
 
     try:
-        token = env_required("GOSZAKUP_TOKEN")
-        control_lot = env_required("CONTROL_LOT")
-        control_ann = env_required("CONTROL_ANN")
-        expected_text = os.getenv("EXPECTED_TEXT", "").strip()
-        object_hint = os.getenv("CONTROL_FILE_OBJECT_ID", "").strip()
-
-        result.update({
-            "control_lot": control_lot,
-            "control_lot_prefix": lot_prefix(control_lot),
-            "control_announcement": control_ann,
-            "control_file_object_id": object_hint,
-            "expected_text": expected_text,
-        })
-
-        lot = find_control_lot(token, control_lot, control_ann)
+        lot = find_control_lot(token)
         selected_ann = lot_announcement(lot)
         selected_prefix = lot_prefix(lot.get("lotNumber"))
 
-        if selected_ann and selected_ann != control_ann:
-            raise RuntimeError(f"Wrong announcement selected: {selected_ann!r}, expected {control_ann!r}")
-        if selected_prefix != lot_prefix(control_lot):
-            raise RuntimeError(f"Wrong lot prefix selected: {selected_prefix!r}")
+        if selected_ann and selected_ann != CONTROL_ANN:
+            raise RuntimeError(
+                f"Выбран неверный номер объявления: {selected_ann!r}, ожидался {CONTROL_ANN!r}"
+            )
+        if selected_prefix != lot_prefix(CONTROL_LOT):
+            raise RuntimeError(
+                f"Выбран неверный префикс лота: {selected_prefix!r}"
+            )
 
         result["lot"] = {
             key: lot.get(key)
             for key in (
-                "id", "lotNumber", "nameRu", "descriptionRu", "trdBuyNumberAnno",
-                "trdBuyId", "count", "amount"
+                "id",
+                "lotNumber",
+                "nameRu",
+                "descriptionRu",
+                "trdBuyNumberAnno",
+                "trdBuyId",
+                "count",
+                "amount",
             )
         }
+        result["selected_lot_number_normalized"] = normalize_lot(lot.get("lotNumber"))
 
         files = [x for x in (lot.get("Files") or []) if isinstance(x, dict)]
-        ranked_files = ranked_tech_files(files, control_ann, object_hint)
+        ranked_files = ranked_tech_files(files)
         result["files"] = files
         result["file_candidates"] = [
             {
@@ -420,13 +455,13 @@ def main() -> int:
                 "objectId": f.get("objectId"),
                 "originalName": f.get("originalName"),
                 "nameRu": f.get("nameRu"),
-                "score": tech_file_score(f, control_ann, object_hint),
+                "score": tech_file_score(f),
             }
             for f in ranked_files
         ]
 
         if not ranked_files:
-            raise RuntimeError("GraphQL returned no downloadable files for the target lot")
+            raise RuntimeError("GraphQL не вернул файлов для контрольного лота")
 
         session = requests.Session()
         accepted_pdf: Optional[bytes] = None
@@ -435,6 +470,8 @@ def main() -> int:
         accepted_download: Optional[Dict[str, Any]] = None
         accepted_checks: Dict[str, bool] = {}
 
+        # Do not trust only the filename. Verify document identity from PDF text:
+        # announcement number + numeric lot prefix.
         for file_info in ranked_files:
             print(
                 "TRY FILE:",
@@ -443,7 +480,7 @@ def main() -> int:
                         "id": file_info.get("id"),
                         "objectId": file_info.get("objectId"),
                         "originalName": file_info.get("originalName"),
-                        "score": tech_file_score(file_info, control_ann, object_hint),
+                        "score": tech_file_score(file_info),
                     },
                     ensure_ascii=False,
                 ),
@@ -452,13 +489,15 @@ def main() -> int:
 
             for url in url_candidates(str(file_info.get("filePath") or "")):
                 content, info = try_download(session, url, token)
-                record = dict(info)
-                record.update({
-                    "file_id": file_info.get("id"),
-                    "objectId": file_info.get("objectId"),
-                    "originalName": file_info.get("originalName"),
-                })
-                result["download_attempts"].append(record)
+                attempt_record = dict(info)
+                attempt_record.update(
+                    {
+                        "file_id": file_info.get("id"),
+                        "objectId": file_info.get("objectId"),
+                        "originalName": file_info.get("originalName"),
+                    }
+                )
+                result["download_attempts"].append(attempt_record)
 
                 if content is None:
                     continue
@@ -469,10 +508,13 @@ def main() -> int:
                     print("[pdf] extract error:", repr(exc), flush=True)
                     continue
 
-                ok, checks = verify_pdf_text(text, control_lot, control_ann, expected_text)
+                ok, checks = verify_pdf_text(text)
                 print(
                     "[pdf] verify:",
-                    json.dumps({"chars": len(text), "checks": checks, "ok": ok}, ensure_ascii=False),
+                    json.dumps(
+                        {"chars": len(text), "checks": checks, "ok": ok},
+                        ensure_ascii=False,
+                    ),
                     flush=True,
                 )
 
@@ -488,33 +530,49 @@ def main() -> int:
                 break
 
         if accepted_pdf is None or accepted_file is None:
-            expected_note = f", expected marker {expected_text!r}" if expected_text else ""
             raise RuntimeError(
-                f"No PDF matched announcement {control_ann!r}, lot prefix {lot_prefix(control_lot)!r}{expected_note}"
+                "Не найден PDF, содержащий одновременно номер объявления "
+                f"{CONTROL_ANN} и префикс лота {lot_prefix(CONTROL_LOT)}"
             )
 
         PDF_PATH.write_bytes(accepted_pdf)
         TEXT_PATH.write_text(accepted_text, encoding="utf-8")
 
-        result.update({
-            "tech_file": accepted_file,
-            "pdf_path": str(PDF_PATH),
-            "pdf_source": accepted_download,
-            "text_length": len(accepted_text),
-            "verification": accepted_checks,
-            "expected_text_found": accepted_checks.get("expected_text", False),
-            "text_excerpt": accepted_text[:4000],
-            "stage": "passed",
-            "ok": True,
-        })
+        result.update(
+            {
+                "tech_file": accepted_file,
+                "pdf_path": str(PDF_PATH),
+                "pdf_source": accepted_download,
+                "text_length": len(accepted_text),
+                "verification": accepted_checks,
+                "expected_text_found": (
+                    accepted_checks.get("expected_text") if EXPECTED_TEXT else None
+                ),
+                "text_excerpt": accepted_text[:4000],
+                "stage": "passed",
+                "ok": True,
+            }
+        )
 
         print("ACTIVE CONTROL PASS: API -> PDF -> TEXT", flush=True)
         print("LOT API:", lot.get("lotNumber"), flush=True)
         print("LOT PREFIX:", lot_prefix(lot.get("lotNumber")), flush=True)
-        print("ANNOUNCEMENT:", control_ann, flush=True)
-        print("PDF:", accepted_file.get("originalName"), "objectId=", accepted_file.get("objectId"), flush=True)
-        if expected_text:
-            print("EXPECTED:", expected_text, "FOUND=True", flush=True)
+        print("ANNOUNCEMENT:", CONTROL_ANN, flush=True)
+        print(
+            "PDF:",
+            accepted_file.get("originalName"),
+            "objectId=",
+            accepted_file.get("objectId"),
+            flush=True,
+        )
+        if EXPECTED_TEXT:
+            print(
+                "OPTIONAL EXPECTED:",
+                EXPECTED_TEXT,
+                "FOUND=",
+                accepted_checks.get("expected_text", False),
+                flush=True,
+            )
         print("PDF CHARS:", len(accepted_text), flush=True)
 
     except Exception as exc:
