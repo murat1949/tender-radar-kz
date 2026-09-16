@@ -15,7 +15,9 @@ Goszakup Collector v1.3 PDF TECHSPEC
   3) нормализует данные;
   4) считает простой приоритет;
   5) сохраняет JSON/CSV;
-  6) при наличии параметров Supabase — отправляет данные в таблицу tenders.
+  6) для активных лотов пытается скачать официальный PDF техспецификации;
+  7) при успехе заменяет краткие требования полным проверенным текстом PDF;
+  8) при сбое PDF сохраняет лот с исходными структурированными данными.
 
 Для живого API нужен официальный токен goszakup.
 Указать его в переменной среды:
@@ -39,7 +41,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin
 
 import requests
 from pypdf import PdfReader
@@ -187,19 +189,50 @@ class Tender:
 def env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
-def request_graphql(token: str, variables: Dict[str, Any], timeout: int = 45) -> Dict[str, Any]:
+def request_graphql(
+    token: str,
+    variables: Dict[str, Any],
+    timeout: int = 60,
+    retries: int = 4,
+) -> Dict[str, Any]:
+    """GraphQL с повтором только временных сетевых/серверных ошибок."""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
-        "User-Agent": "ProcureVision-KZ/0.1",
+        "User-Agent": "Tender-Radar-KZ-Goszakup/1.3",
     }
     payload = {"query": QUERY, "variables": variables}
-    r = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("errors"):
-        raise RuntimeError("GraphQL error: " + json.dumps(data["errors"], ensure_ascii=False))
-    return data
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(
+                GRAPHQL_URL,
+                headers=headers,
+                json=payload,
+                timeout=(15, timeout),
+            )
+            r.raise_for_status()
+            data = r.json()
+            if data.get("errors"):
+                raise RuntimeError(
+                    "GraphQL error: " + json.dumps(data["errors"], ensure_ascii=False)
+                )
+            return data
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            print(f"  GraphQL temporary network error {attempt}/{retries}: {exc}", file=sys.stderr)
+        except requests.HTTPError as exc:
+            last_error = exc
+            status = getattr(exc.response, "status_code", None)
+            if status not in (408, 425, 429, 500, 502, 503, 504):
+                raise
+            print(f"  GraphQL temporary HTTP {status} {attempt}/{retries}", file=sys.stderr)
+
+        if attempt < retries:
+            time.sleep(3 * attempt)
+
+    raise RuntimeError(f"Goszakup GraphQL unavailable after {retries} attempts: {last_error!r}")
 
 def safe(d: Optional[Dict[str, Any]], key: str, default: Any = "") -> Any:
     if not d:
@@ -280,7 +313,6 @@ def _uniq_join(values: Iterable[Any], sep: str = "; ") -> str:
 
 def parse_product_fields(text: str) -> Dict[str, str]:
     """Небольшой безопасный разбор товарных характеристик из открытого текста API."""
-    import re
     src = _compact_text(text)
     low = src.lower()
     out: Dict[str, str] = {}
@@ -319,10 +351,10 @@ def parse_product_fields(text: str) -> Dict[str, str]:
     return out
 
 def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Строит базовый raw.techspec из GraphQL v3.
+    """Строит raw.techspec из структурированных полей GraphQL v3.
 
-    Полный текст PDF добавляется после дедупликации функцией enrich_pdf_techspec(),
-    чтобы не скачивать один и тот же документ повторно для разных ключевых слов.
+    Важно: это не OCR/PDF-парсер. На этом шаге используем официальные открытые
+    поля лота/пункта плана и метаданные документов. Сам PDF сохраняется в files.
     """
     plans = lot.get("Plans") if isinstance(lot.get("Plans"), list) else []
     plan = next((x for x in plans if isinstance(x, dict)), {})
@@ -363,6 +395,7 @@ def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                    "техничес" in orig.lower() or "techspec" in orig.lower())
         tech_files.append({
             "id": f.get("id"),
+            "object_id": f.get("objectId"),
             "name": label or orig,
             "original_name": orig,
             "file_path": f.get("filePath"),
@@ -397,165 +430,306 @@ def build_techspec(lot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _looks_like_pdf(content: bytes, content_type: str = "") -> bool:
-    return bool(content) and (content[:16].startswith(b"%PDF") or "pdf" in (content_type or "").lower())
+def _normalize_lot(value: Any) -> str:
+    """Нормализация визуально похожих символов в номере лота."""
+    text = _compact_text(value).upper()
+    text = text.translate(str.maketrans({
+        "З": "3",
+        "–": "-",
+        "—": "-",
+        "−": "-",
+        "‑": "-",
+        "‐": "-",
+    }))
+    return re.sub(r"\s+", "", text)
 
 
-def _url_candidates(file_path: str) -> List[str]:
-    p = _compact_text(file_path)
-    if not p:
+def _lot_prefix(value: Any) -> str:
+    m = re.search(r"\d{6,}", _normalize_lot(value))
+    return m.group(0) if m else ""
+
+
+def _normalize_pdf_text(value: Any) -> str:
+    text = str(value or "").replace("\u00ad", "").replace("\u200b", "")
+    return " ".join(text.lower().split())
+
+
+def _looks_like_pdf(content: bytes, content_type: str) -> bool:
+    return content[:16].startswith(b"%PDF") or "pdf" in (content_type or "").lower()
+
+
+def _pdf_urls(file_path: Any) -> List[str]:
+    path = _compact_text(file_path)
+    if not path:
         return []
-    if p.startswith("http://") or p.startswith("https://"):
-        return [p]
-    pp = p if p.startswith("/") else "/" + p
+    if path.startswith(("http://", "https://")):
+        return [path]
+
+    relative = path if path.startswith("/") else "/" + path
+    # Первый адрес — тот же официальный хост, на котором контрольный тест уже прошёл.
     bases = (
         "https://ows.goszakup.gov.kz",
         "https://goszakup.gov.kz",
         "https://www.goszakup.gov.kz",
         "https://procurement.gov.kz",
-        "https://old.goszakup.gov.kz",
     )
-    return [base + pp for base in bases]
+    return list(dict.fromkeys(urljoin(base, relative) for base in bases))
+
+
+def _pdf_file_score(file_info: Dict[str, Any], announcement_number: str) -> int:
+    name = _compact_text(file_info.get("name"))
+    orig = _compact_text(file_info.get("original_name"))
+    path = _compact_text(file_info.get("file_path"))
+    blob = " ".join([name, orig, path]).lower()
+    score = 0
+    if file_info.get("is_techspec"):
+        score += 100
+    if "techspec" in blob or "tech_spec" in blob:
+        score += 80
+    if "техничес" in blob or "спецификац" in blob or "техспец" in blob:
+        score += 60
+    if ".pdf" in blob:
+        score += 30
+    ann_head = str(announcement_number or "").split("-")[0]
+    if ann_head and ann_head in blob:
+        score += 20
+    if "договор" in blob or "contract" in blob:
+        score -= 100
+    return score
 
 
 def _extract_pdf_text(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    parts: List[str] = []
-    max_pages = int(env("GOSZAKUP_PDF_MAX_PAGES", "30") or "30")
-    for page in list(reader.pages)[:max_pages]:
-        parts.append(page.extract_text() or "")
-    text = "\n".join(parts)
+    text = "\n".join((page.extract_text() or "") for page in reader.pages)
     text = text.replace("\u00ad", "").replace("\u200b", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    max_chars = int(env("GOSZAKUP_PDF_MAX_CHARS", "24000") or "24000")
-    return text.strip()[:max_chars]
+    return text.strip()
 
 
-def _is_current_tender(t: Tender) -> bool:
-    # Основной критерий — срок ещё не прошёл. Статусы Госзакупа меняются и
-    # могут называться по-разному, поэтому не делаем жёсткую зависимость от текста статуса.
-    end_dt = parse_dt(t.end_date)
-    if end_dt is not None:
-        return end_dt >= datetime.now()
-    low = (t.status or "").lower()
-    return ("прием" in low or "приём" in low or "опублик" in low)
+def _verify_pdf_identity(text: str, announcement_number: str, lot_number: str) -> Dict[str, bool]:
+    haystack = _normalize_pdf_text(text)
+    ann = _normalize_pdf_text(announcement_number)
+    prefix = _normalize_pdf_text(_lot_prefix(lot_number))
+    return {
+        "announcement": bool(ann and ann in haystack),
+        "lot_prefix": bool(prefix and prefix in haystack),
+    }
 
 
-def _download_techspec_pdf(t: Tender, token: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    tech = t.techspec if isinstance(t.techspec, dict) else None
-    if not tech:
-        return None, {"reason": "no_techspec"}
-    files = tech.get("files") if isinstance(tech.get("files"), list) else []
-    candidates = [f for f in files if isinstance(f, dict) and f.get("is_techspec")]
-    if not candidates:
-        return None, {"reason": "no_techspec_file"}
+def _download_pdf(
+    session: requests.Session,
+    file_info: Dict[str, Any],
+    token: str,
+) -> Tuple[Optional[bytes], Optional[str], str, bool]:
+    """Возвращает (bytes, final_url, error, had_network_error). Без долгих повторов."""
+    last_error = ""
+    had_network_error = False
+    urls = _pdf_urls(file_info.get("file_path"))
+    if not urls:
+        return None, None, "empty file_path", False
 
-    # Если документов несколько, сначала пробуем самые явно похожие на техспецификацию.
-    def score(f: Dict[str, Any]) -> int:
-        blob = " ".join(str(f.get(k) or "").lower() for k in ("name", "original_name", "file_path"))
-        s = 0
-        if "техничес" in blob: s += 10
-        if "спецификац" in blob: s += 10
-        if "techspec" in blob or "tech_spec" in blob: s += 10
-        if ".pdf" in blob: s += 2
-        if "договор" in blob: s -= 5
-        return s
-
-    candidates = sorted(candidates, key=score, reverse=True)
-    headers_variants = [
-        {"Authorization": f"Bearer {token}", "User-Agent": "Tender-Radar-KZ/1.3"},
-        {"User-Agent": "Mozilla/5.0 Tender-Radar-KZ/1.3"},
-    ]
-    last: Dict[str, Any] = {}
-    for f in candidates[:3]:
-        fp = str(f.get("file_path") or "")
-        for url in _url_candidates(fp):
-            for headers in headers_variants:
-                for attempt in range(2):
-                    try:
-                        r = requests.get(url, headers=headers, timeout=(10, 35), allow_redirects=True)
-                        last = {
-                            "url": url,
-                            "status": r.status_code,
-                            "bytes": len(r.content),
-                            "original_name": f.get("original_name"),
-                            "authorized": "Authorization" in headers,
-                        }
-                        if r.ok and _looks_like_pdf(r.content, r.headers.get("content-type", "")):
-                            text = _extract_pdf_text(r.content)
-                            if text:
-                                return text, last
-                    except Exception as e:
-                        last = {"url": url, "error": repr(e), "original_name": f.get("original_name")}
-                    if attempt == 0:
-                        time.sleep(0.4)
-    return None, last or {"reason": "download_failed"}
-
-
-def enrich_pdf_techspec(items: List[Tender], token: str) -> None:
-    """Добавляет настоящий текст PDF в raw.techspec.technical_requirements.
-
-    Обрабатываем только текущие лоты и только те, где GraphQL вернул файл техспеки.
-    Скачивание идёт параллельно, чтобы общий сбор не растягивался на десятки минут.
-    """
-    enabled = env("GOSZAKUP_PDF_TECHSPEC", "1").lower() not in {"0", "false", "no", "off"}
-    if not enabled:
-        print("PDF TECHSPEC: disabled")
-        return
-
-    targets = [
-        t for t in items
-        if _is_current_tender(t)
-        and isinstance(t.techspec, dict)
-        and t.techspec.get("has_techspec_file")
-    ]
-    if not targets:
-        print("PDF TECHSPEC: no current targets")
-        return
-
-    workers = max(1, min(int(env("GOSZAKUP_PDF_WORKERS", "6") or "6"), 10))
-    print(f"PDF TECHSPEC: targets={len(targets)} workers={workers}", flush=True)
-
-    ok = 0
-    failed = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_map = {pool.submit(_download_techspec_pdf, t, token): t for t in targets}
-        for fut in as_completed(future_map):
-            t = future_map[fut]
+    for url in urls:
+        for authorized in (True, False):
+            headers = {"User-Agent": "Tender-Radar-KZ-Goszakup/1.3"}
+            if authorized:
+                headers["Authorization"] = f"Bearer {token}"
             try:
-                text, info = fut.result()
-            except Exception as e:
-                text, info = None, {"error": repr(e)}
-            tech = t.techspec if isinstance(t.techspec, dict) else {}
-            if text:
-                # ВАЖНО: именно это поле читает карточка Tender Radar.
-                tech["technical_requirements"] = text
-                tech["pdf_extracted"] = True
-                tech["pdf_text_length"] = len(text)
-                tech["pdf_source"] = info.get("url")
-                tech["pdf_original_name"] = info.get("original_name")
-                # Поля товара тоже разбираем уже по настоящей техспецификации.
-                tech["parsed_fields"] = parse_product_fields(text)
-                ok += 1
-                if str(t.external_id) == "87884071" or str(t.lot_number).startswith("87884071"):
-                    low = text.lower()
-                    print(
-                        "PDF CONTROL 87884071:",
-                        "CB435A=", "cb435a" in low,
-                        "1500=", ("1500" in low or "1 500" in low),
-                        "P1005=", "p1005" in low,
-                        "P1006=", "p1006" in low,
-                        "chars=", len(text),
-                        flush=True,
-                    )
-            else:
-                tech["pdf_extracted"] = False
-                tech["pdf_error"] = info
-                failed += 1
-            t.techspec = tech
+                r = session.get(
+                    url,
+                    headers=headers,
+                    timeout=(8, 22),
+                    allow_redirects=True,
+                )
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                had_network_error = True
+                last_error = f"network: {type(exc).__name__}"
+                # Не повторяем тот же URL бесконечно: следующий час даст новую попытку.
+                break
+            except requests.RequestException as exc:
+                last_error = f"request: {type(exc).__name__}"
+                break
 
-    print(f"PDF TECHSPEC: extracted={ok} failed={failed}", flush=True)
+            if r.ok and _looks_like_pdf(r.content, r.headers.get("content-type", "")):
+                return r.content, r.url, "", had_network_error
+
+            last_error = f"HTTP {r.status_code}, type={r.headers.get('content-type', '')}"
+            # Для обычного 404/400 второй вариант заголовков бессмыслен.
+            if r.status_code not in (401, 403):
+                break
+
+    return None, None, last_error or "PDF download failed", had_network_error
+
+
+def _tender_is_active(tender: Tender) -> bool:
+    status = str(tender.status or "").lower()
+    if "прием" in status or "приём" in status:
+        return True
+    end_date = parse_dt(tender.end_date)
+    return bool(end_date and end_date > datetime.now())
+
+
+def enrich_pdf_techspecs(items: List[Tender], token: str) -> Dict[str, int]:
+    """Добавляет полный PDF-текст активным лотам, не ломая сбор при сбое PDF.
+
+    Важное правило: PDF — обогащение. Если Госзакуп временно не отдаёт файл,
+    сам лот всё равно остаётся в tenders.json с GraphQL-техспецификацией.
+    """
+    enabled = env("GOSZAKUP_PDF_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+    limit_raw = env("GOSZAKUP_PDF_LIMIT", "0")
+    breaker_raw = env("GOSZAKUP_PDF_BREAKER", "5")
+    try:
+        limit = max(0, int(limit_raw))
+    except ValueError:
+        limit = 0
+    try:
+        breaker = max(1, int(breaker_raw))
+    except ValueError:
+        breaker = 5
+
+    stats = {
+        "active": 0,
+        "eligible": 0,
+        "attempted": 0,
+        "extracted": 0,
+        "failed": 0,
+        "breaker_stopped": 0,
+    }
+    if not enabled:
+        print("[pdf] enrichment disabled by GOSZAKUP_PDF_ENABLED")
+        return stats
+
+    active_items = [x for x in items if _tender_is_active(x)]
+    stats["active"] = len(active_items)
+    if limit:
+        active_items = active_items[:limit]
+
+    session = requests.Session()
+    consecutive_network_failures = 0
+
+    print(f"[pdf] active lots selected: {len(active_items)}")
+
+    for pos, tender in enumerate(active_items, 1):
+        tech = tender.techspec if isinstance(tender.techspec, dict) else None
+        if not tech:
+            continue
+        files = tech.get("files") if isinstance(tech.get("files"), list) else []
+        candidates = [x for x in files if isinstance(x, dict) and x.get("file_path")]
+        if not candidates:
+            tech["pdf_extraction_attempted"] = False
+            tech["pdf_extracted"] = False
+            tech["pdf_error"] = "no document file_path in GraphQL"
+            continue
+
+        stats["eligible"] += 1
+        tech["pdf_extraction_attempted"] = True
+        stats["attempted"] += 1
+        candidates = sorted(
+            candidates,
+            key=lambda x: _pdf_file_score(x, tender.announcement_number),
+            reverse=True,
+        )[:3]
+
+        accepted_text = ""
+        accepted_file: Optional[Dict[str, Any]] = None
+        accepted_url: Optional[str] = None
+        accepted_checks: Dict[str, bool] = {}
+        errors: List[str] = []
+        lot_network_error = False
+
+        for file_info in candidates:
+            content, final_url, error, network_error = _download_pdf(session, file_info, token)
+            lot_network_error = lot_network_error or network_error
+            if content is None:
+                errors.append(f"{file_info.get('original_name') or file_info.get('name')}: {error}")
+                continue
+
+            try:
+                text = _extract_pdf_text(content)
+            except Exception as exc:
+                errors.append(
+                    f"{file_info.get('original_name') or file_info.get('name')}: extract {type(exc).__name__}"
+                )
+                continue
+
+            if len(text) < 50:
+                errors.append(
+                    f"{file_info.get('original_name') or file_info.get('name')}: extracted text too short ({len(text)})"
+                )
+                continue
+
+            checks = _verify_pdf_identity(
+                text,
+                tender.announcement_number,
+                tender.lot_number,
+            )
+            if not (checks.get("announcement") and checks.get("lot_prefix")):
+                errors.append(
+                    f"{file_info.get('original_name') or file_info.get('name')}: identity {checks}"
+                )
+                continue
+
+            accepted_text = text
+            accepted_file = file_info
+            accepted_url = final_url
+            accepted_checks = checks
+            break
+
+        if accepted_text and accepted_file:
+            previous_requirements = str(tech.get("technical_requirements") or "").strip()
+            if previous_requirements and not tech.get("structured_requirements"):
+                tech["structured_requirements"] = previous_requirements
+
+            tech["technical_requirements"] = accepted_text
+            tech["source"] = "goszakup_pdf_verified"
+            tech["pdf_extracted"] = True
+            tech["pdf_text_length"] = len(accepted_text)
+            tech["pdf_source"] = accepted_url
+            tech["pdf_original_name"] = accepted_file.get("original_name") or accepted_file.get("name")
+            tech["pdf_object_id"] = accepted_file.get("object_id")
+            tech["pdf_verification"] = accepted_checks
+            tech["pdf_error"] = None
+            tech["has_techspec_file"] = True
+
+            # Поля, распознанные из полного PDF, дополняют, но не стирают GraphQL-разбор.
+            parsed = tech.get("parsed_fields") if isinstance(tech.get("parsed_fields"), dict) else {}
+            pdf_parsed = parse_product_fields(accepted_text)
+            for key, value in pdf_parsed.items():
+                if value and not parsed.get(key):
+                    parsed[key] = value
+            tech["parsed_fields"] = parsed
+
+            stats["extracted"] += 1
+            consecutive_network_failures = 0
+            print(
+                f"[pdf {pos}/{len(active_items)}] OK lot={tender.lot_number} "
+                f"chars={len(accepted_text)} file={tech.get('pdf_original_name')}"
+            )
+        else:
+            tech["pdf_extracted"] = False
+            tech["pdf_error"] = " | ".join(errors)[:1200] or "no verified PDF text"
+            stats["failed"] += 1
+            if lot_network_error:
+                consecutive_network_failures += 1
+            else:
+                consecutive_network_failures = 0
+            print(
+                f"[pdf {pos}/{len(active_items)}] SKIP lot={tender.lot_number}: "
+                f"{tech['pdf_error'][:220]}"
+            )
+
+            # Если сам файловый сервер Госзакупа массово недоступен, не ждём таймаут
+            # на каждом из сотни лотов. Через час workflow попробует снова.
+            if consecutive_network_failures >= breaker:
+                stats["breaker_stopped"] = len(active_items) - pos
+                print(
+                    f"[pdf] circuit breaker: {consecutive_network_failures} consecutive "
+                    f"network failures; remaining {stats['breaker_stopped']} lots keep GraphQL techspec"
+                )
+                break
+
+    return stats
+
 
 def normalize(lot: Dict[str, Any], keyword: str) -> Tender:
     buy = lot.get("TrdBuy") or {}
@@ -724,13 +898,26 @@ def main() -> int:
         time.sleep(0.3)
 
     items = deduplicate(all_items)
-    enrich_pdf_techspec(items, token)
+
+    # Производственное PDF-обогащение выполняется только после дедупликации,
+    # поэтому один и тот же лот не скачивается повторно из-за нескольких ключевых слов.
+    pdf_stats = enrich_pdf_techspecs(items, token)
+
     json_path = save_json(items)
     csv_path = save_csv(items)
 
-    # Supabase синхронизирует auto_collect_and_sync.py. Сам коллектор пишет только JSON/CSV,
-    # чтобы не было второго неполного POST без raw.techspec.
+    try:
+        upload_supabase(items)
+        if env("SUPABASE_URL") and env("SUPABASE_SERVICE_ROLE_KEY"):
+            print("Supabase: данные отправлены.")
+    except Exception as e:
+        print(f"Supabase error: {e}", file=sys.stderr)
+
     print(f"Итого уникальных лотов: {len(items)}")
+    print(
+        "PDF: active={active} eligible={eligible} attempted={attempted} "
+        "extracted={extracted} failed={failed} breaker_stopped={breaker_stopped}".format(**pdf_stats)
+    )
     print(f"JSON: {json_path}")
     print(f"CSV : {csv_path}")
     return 0
