@@ -819,54 +819,9 @@ def save_csv(items: List[Tender]) -> Path:
             w.writerow(asdict(item))
     return path
 
-def upload_supabase(items: List[Tender]) -> None:
-    url = env("SUPABASE_URL")
-    key = env("SUPABASE_SERVICE_ROLE_KEY")
-    if not url or not key or not items:
-        return
-
-    endpoint = url.rstrip("/") + "/rest/v1/tenders"
-    headers = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates,return=minimal",
-    }
-
-    payload = []
-    for t in items:
-        d = asdict(t)
-        payload.append({
-            "source": d["source"],
-            "external_id": d["external_id"],
-            "lot_number": d["lot_number"],
-            "announcement_number": d["announcement_number"],
-            "title": d["title"],
-            "description": d["description"],
-            "customer_name": d["customer_name"],
-            "customer_bin": d["customer_bin"],
-            "organizer_name": d["organizer_name"],
-            "organizer_bin": d["organizer_bin"],
-            "amount_kzt": d["amount_kzt"],
-            "quantity": d["quantity"],
-            "publish_date": d["publish_date"] or None,
-            "start_date": d["start_date"] or None,
-            "end_date": d["end_date"] or None,
-            "status": d["status"],
-            "trade_method": d["trade_method"],
-            "customer_phone": d["customer_phone"],
-            "customer_email": d["customer_email"],
-            "organizer_phone": d["organizer_phone"],
-            "organizer_email": d["organizer_email"],
-            "public_url": d["public_url"],
-            "keyword": d["keyword"],
-            "priority_score": d["priority_score"],
-            "priority_label": d["priority_label"],
-            "collected_at": d["collected_at"],
-        })
-
-    r = requests.post(endpoint, headers=headers, json=payload, timeout=45)
-    r.raise_for_status()
+# Supabase upload is intentionally handled only by auto_collect_and_sync.py.
+# Keeping the collector read/transform-only avoids a duplicate write path and
+# schema mismatch with the production `tenders` table.
 
 def load_keywords() -> List[str]:
     raw = env("GOSZAKUP_KEYWORDS")
@@ -906,12 +861,7 @@ def main() -> int:
     json_path = save_json(items)
     csv_path = save_csv(items)
 
-    try:
-        upload_supabase(items)
-        if env("SUPABASE_URL") and env("SUPABASE_SERVICE_ROLE_KEY"):
-            print("Supabase: данные отправлены.")
-    except Exception as e:
-        print(f"Supabase error: {e}", file=sys.stderr)
+    print("Supabase upload: skipped here; auto_collect_and_sync.py owns production sync.")
 
     print(f"Итого уникальных лотов: {len(items)}")
     print(
