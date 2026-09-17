@@ -5,7 +5,7 @@ import sys
 import json
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -68,6 +68,43 @@ def nempty(v):
         return v if v else None
     return v
 
+
+
+KZ_TZ = timezone(timedelta(hours=5))
+
+
+def normalize_goszakup_datetime(v):
+    """
+    Goszakup GraphQL returns Kazakhstan wall-clock timestamps without an offset.
+    Treat naive values as Kazakhstan time (UTC+5) before sending them to Supabase,
+    otherwise PostgreSQL may interpret them as UTC and the portal shifts them again.
+    """
+    s = nempty(v)
+    if not s:
+        return None
+    raw = str(s).strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KZ_TZ)
+        return dt.isoformat()
+    except Exception:
+        return raw
+
+
+def goszakup_is_active(status, expires_at):
+    status_active = ("прием" in status.lower() or "приём" in status.lower())
+    if not status_active:
+        return False
+    if not expires_at:
+        return True
+    try:
+        exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=KZ_TZ)
+        return exp > datetime.now(timezone.utc)
+    except Exception:
+        return status_active
 
 def load_json(path):
     if not path.exists():
@@ -211,6 +248,10 @@ def make_goszakup():
             continue
 
         status = str(r.get("status") or "")
+        published_at = normalize_goszakup_datetime(r.get("publish_date"))
+        started_at = normalize_goszakup_datetime(r.get("start_date"))
+        expires_at = normalize_goszakup_datetime(r.get("end_date"))
+        is_active = goszakup_is_active(status, expires_at)
 
         out.append({
             "source_code": "goszakup",
@@ -230,10 +271,10 @@ def make_goszakup():
             "quantity": r.get("quantity"),
             "unit": nempty(r.get("unit")),
             "category": nempty(r.get("category")),
-            "published_at": nempty(r.get("publish_date")),
-            "started_at": nempty(r.get("start_date")),
-            "expires_at": nempty(r.get("end_date")),
-            "is_active": ("прием" in status.lower() or "приём" in status.lower()),
+            "published_at": published_at,
+            "started_at": started_at,
+            "expires_at": expires_at,
+            "is_active": is_active,
             "raw": r,
         })
 
@@ -420,7 +461,16 @@ def main():
         )
 
         rows = make_goszakup()
+        active_rows = sum(1 for r in rows if r.get("is_active") is True)
         print("Prepared for Supabase:", len(rows))
+        print("Goszakup current active lots:", active_rows)
+
+        if not rows:
+            raise RuntimeError("Goszakup returned 0 rows - old data left untouched")
+
+        # Keep history, but prevent old rows that disappeared from the latest source
+        # from staying active forever.
+        deactivate_existing_source(cfg, "goszakup")
         totals["goszakup"] = upload_rows(cfg, "goszakup", rows)
         update_source(cfg, "goszakup", True)
 
