@@ -39,6 +39,8 @@ from selenium.webdriver.support import expected_conditions as EC
 
 
 BASE_URL = "https://zakup.sk.kz"
+SEARCH_AD_STATUS = "PUBLISHED"
+SEARCH_LOT_STATUS = "PUBLISHED"
 
 KEYWORDS = [
     "картридж",
@@ -226,6 +228,8 @@ def row_has_active_hint(row):
     raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
     if clean_text(raw.get("remaining_text")):
         return True
+    if raw.get("search_filter_live") is True:
+        return True
     if raw.get("status_detected") and is_live_status_text(row.get("status_name")):
         return True
     expires_at = clean_text(row.get("expires_at"))
@@ -242,14 +246,14 @@ def row_has_active_hint(row):
 def lot_search_url(keyword, page=1):
     return (
         f"{BASE_URL}/#/ext?"
-        f"tabs=lot&q={quote(keyword)}&adst=ALL&lst=ALL&page={int(page)}"
+        f"tabs=lot&q={quote(keyword)}&adst={SEARCH_AD_STATUS}&lst={SEARCH_LOT_STATUS}&page={int(page)}"
     )
 
 
 def lot_fallback_url(lot_id, keyword="картридж", page=1):
     return (
         f"{BASE_URL}/#/ext(popup:item/{lot_id}/lot)?"
-        f"tabs=lot&q={quote(keyword)}&adst=ALL&lst=ALL&page={int(page)}"
+        f"tabs=lot&q={quote(keyword)}&adst={SEARCH_AD_STATUS}&lst={SEARCH_LOT_STATUS}&page={int(page)}"
     )
 
 
@@ -396,7 +400,8 @@ def parse_list_snapshot(item, keyword, page):
         ):
             status_name = line
 
-    active_hint = bool(remaining) or is_live_status_text(status_name)
+    search_filter_live = (SEARCH_AD_STATUS == "PUBLISHED" and SEARCH_LOT_STATUS == "PUBLISHED")
+    active_hint = bool(remaining) or is_live_status_text(status_name) or search_filter_live
     blob = f"{title} {text}"
 
     return {
@@ -429,6 +434,7 @@ def parse_list_snapshot(item, keyword, page):
             "amount_text": amount_text,
             "status_detected": bool(status_name),
             "active_hint": active_hint,
+            "search_filter_live": search_filter_live,
             "list_text": text,
             "is_service": is_service(blob),
             "is_relevant_goods": is_relevant_goods(blob),
@@ -504,7 +510,8 @@ def parse_list_card(card, keyword, page):
         ):
             status_name = line
 
-    active_hint = bool(remaining) or is_live_status_text(status_name)
+    search_filter_live = (SEARCH_AD_STATUS == "PUBLISHED" and SEARCH_LOT_STATUS == "PUBLISHED")
+    active_hint = bool(remaining) or is_live_status_text(status_name) or search_filter_live
     blob = f"{title} {text}"
 
     return {
@@ -537,6 +544,7 @@ def parse_list_card(card, keyword, page):
             "amount_text": amount_text,
             "status_detected": bool(status_name),
             "active_hint": active_hint,
+            "search_filter_live": search_filter_live,
             "list_text": clean_text(text),
             "is_service": is_service(blob),
             "is_relevant_goods": is_relevant_goods(blob),
@@ -1489,6 +1497,7 @@ def main():
     print("ENTITY LEVEL: LOT")
     print("DETAIL MODE: FRESH PAGE PER ACTIVE LOT + EXACT DEADLINE + TECHSPEC")
     print("MODE: READ ONLY, NO SUPABASE WRITE")
+    print("SEARCH FILTER: adst=PUBLISHED lst=PUBLISHED")
     print("=" * 78)
 
     driver = make_driver()
