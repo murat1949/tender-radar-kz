@@ -201,6 +201,44 @@ def is_relevant_goods(text):
     return any(re.search(p, low, re.I) for p in GOODS_PATTERNS)
 
 
+def is_live_status_text(value):
+    """
+    Возвращает True только если Samruk действительно показал в карточке списка
+    признак текущего живого статуса. Важно: не полагаемся на наш резервный
+    текст "Опубликовано", если сам портал его не прислал.
+    """
+    low = clean_text(value).lower()
+    if not low:
+        return False
+    return any(x in low for x in (
+        "опубликован",
+        "обсуждени",
+        "прием заяв",
+        "приём заяв",
+    ))
+
+
+def row_has_active_hint(row):
+    """
+    Быстрый признак актуальности до открытия подробной карточки.
+    Используем только реальные признаки из выдачи или уже известный deadline.
+    """
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    if clean_text(raw.get("remaining_text")):
+        return True
+    if raw.get("status_detected") and is_live_status_text(row.get("status_name")):
+        return True
+    expires_at = clean_text(row.get("expires_at"))
+    if expires_at:
+        try:
+            exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            now = datetime.now(exp.tzinfo or timezone.utc)
+            return exp > now
+        except Exception:
+            pass
+    return False
+
+
 def lot_search_url(keyword, page=1):
     return (
         f"{BASE_URL}/#/ext?"
@@ -358,6 +396,7 @@ def parse_list_snapshot(item, keyword, page):
         ):
             status_name = line
 
+    active_hint = bool(remaining) or is_live_status_text(status_name)
     blob = f"{title} {text}"
 
     return {
@@ -381,13 +420,15 @@ def parse_list_snapshot(item, keyword, page):
         "published_at": None,
         "started_at": None,
         "expires_at": remaining_to_expires_at(remaining),
-        "is_active": bool(remaining),
+        "is_active": active_hint,
         "raw": {
             "entity_level": "lot",
             "keyword": keyword,
             "page": page,
             "remaining_text": remaining,
             "amount_text": amount_text,
+            "status_detected": bool(status_name),
+            "active_hint": active_hint,
             "list_text": text,
             "is_service": is_service(blob),
             "is_relevant_goods": is_relevant_goods(blob),
@@ -463,6 +504,7 @@ def parse_list_card(card, keyword, page):
         ):
             status_name = line
 
+    active_hint = bool(remaining) or is_live_status_text(status_name)
     blob = f"{title} {text}"
 
     return {
@@ -486,13 +528,15 @@ def parse_list_card(card, keyword, page):
         "published_at": None,
         "started_at": None,
         "expires_at": remaining_to_expires_at(remaining),
-        "is_active": bool(remaining),
+        "is_active": active_hint,
         "raw": {
             "entity_level": "lot",
             "keyword": keyword,
             "page": page,
             "remaining_text": remaining,
             "amount_text": amount_text,
+            "status_detected": bool(status_name),
+            "active_hint": active_hint,
             "list_text": clean_text(text),
             "is_service": is_service(blob),
             "is_relevant_goods": is_relevant_goods(blob),
@@ -1360,13 +1404,11 @@ def collect(driver):
 
 
 def enrich_rows(driver, rows):
-    # Актуальность на этом этапе определяется текущей выдачей Samruk:
-    # у открытых лотов есть "Осталось: ...".
-    # Количество НЕ фиксировано: сегодня 11, завтра может быть 7, 15, 30...
-    active_targets = [
-        r for r in rows
-        if clean_text((r.get("raw") or {}).get("remaining_text"))
-    ]
+    # Раньше актуальность определялась только по строке "Осталось: ...".
+    # Samruk изменил выдачу: эта строка может исчезнуть у реально активного лота.
+    # Теперь используем несколько независимых признаков из текущей выдачи,
+    # а затем подтверждаем точный deadline в подробной карточке лота.
+    active_targets = [r for r in rows if row_has_active_hint(r)]
 
     if DETAIL_LIMIT > 0:
         # Используется только быстрым тестовым workflow.
@@ -1422,7 +1464,8 @@ def enrich_rows(driver, rows):
             # открывается с чистой загрузки своей страницы поиска.
             save_results(rows)
 
-    # Все лоты без "Осталось" сейчас считаем неактивными.
+    # Всё, что не получило ни одного актуального признака из свежей выдачи,
+    # считаем неактивным. Точный deadline у проверенных целей имеет приоритет.
     active_ids = {str(r.get("source_lot_id")) for r in active_targets}
     for row in rows:
         if str(row.get("source_lot_id")) not in active_ids:
@@ -1466,7 +1509,7 @@ def main():
         print("")
         print("ALL RELEVANT LOTS:", len(rows))
         print("GOODS SAVED:", len(goods_rows))
-        print("CURRENT ACTIVE LOTS:", sum(bool(clean_text((r.get("raw") or {}).get("remaining_text"))) for r in rows))
+        print("CURRENT ACTIVE LOTS:", sum(r.get("is_active") is True for r in rows))
         print("DETAILS TARGETED:", sum((r.get("raw") or {}).get("detail_checked") is True or (r.get("raw") or {}).get("detail_error") not in (None, "DETAIL_LIMIT reached (test mode)") for r in rows))
         print("DETAILS OK:", sum(r.get("raw", {}).get("detail_checked") is True for r in rows))
         print("WITH EXPIRES_AT:", sum(bool(r.get("expires_at")) for r in rows))
