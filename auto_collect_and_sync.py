@@ -93,7 +93,10 @@ def normalize_goszakup_datetime(v):
 
 
 def goszakup_is_active(status, expires_at):
-    status_active = ("прием" in status.lower() or "приём" in status.lower())
+    st = status.lower().strip()
+    # «Опубликован» — активный статус новой платформы zakup.gov.kz (status_id 6),
+    # приём ценовых предложений по нему идёт до offer_end_date.
+    status_active = ("прием" in st or "приём" in st or st == "опубликован")
     if not status_active:
         return False
     if not expires_at:
