@@ -21,7 +21,7 @@ jobs:
         run: |
           python -u - <<'PY'
           import json
-          import auto_collect_and_sync as a
+          import auto_collect_and_sync_READY as a
           a.collect_goszakup_via_zakup()
           rows = a.make_goszakup()
           active = [r for r in rows if r["is_active"]]

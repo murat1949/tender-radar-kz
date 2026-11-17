@@ -190,7 +190,9 @@ def make_goszakup():
             "published_at": nempty(r.get("publish_date")),
             "started_at": nempty(r.get("start_date")),
             "expires_at": nempty(r.get("end_date")),
-            "is_active": ("прием" in status.lower() or "приём" in status.lower()),
+            # «Опубликован» — активный статус новой платформы zakup.gov.kz (status_id 6).
+            "is_active": ("прием" in status.lower() or "приём" in status.lower()
+                          or status.lower().strip() == "опубликован"),
             "raw": r,
         })
 
@@ -271,6 +273,45 @@ def update_source(cfg, source, ok=True, err=None):
         print("WARNING: source status update failed:", source, repr(e))
 
 
+GOSZAKUP_KEYWORDS = [
+    "картридж",
+    "тонер",
+    "заправка картриджей",
+    "расходные материалы для оргтехники",
+]
+
+
+def collect_goszakup_via_zakup():
+    """Открытые лоты Госзакупа с zakup.gov.kz -> OUT/tenders.json
+    (тот же формат, что у collector_goszakup.py, его читает make_goszakup)."""
+    import collector_zakup
+
+    raw = os.getenv("GOSZAKUP_KEYWORDS", "")
+    keywords = [x.strip() for x in raw.split(",") if x.strip()] or GOSZAKUP_KEYWORDS
+    items = []
+    failed = 0
+    for keyword in keywords:
+        try:
+            found = collector_zakup.collect_keyword(keyword)
+            print("[zakup]", keyword, "- open lots:", len(found))
+            items.extend(found)
+        except Exception as e:
+            failed += 1
+            print("[zakup]", keyword, "- ERROR:", repr(e))
+    if failed == len(keywords):
+        raise RuntimeError("zakup.gov.kz did not answer for any keyword")
+    try:
+        recent = collector_zakup.crawl_recent(keywords, hours=8)
+        print("[zakup] recent crawl matched:", len(recent))
+        items.extend(recent)
+    except Exception as e:
+        print("[zakup] recent crawl ERROR:", repr(e))
+    items = collector_zakup.deduplicate(items)
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "tenders.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("[zakup] unique open lots:", len(items))
+
+
 def main():
     print("=" * 70)
     print("TENDER RADAR KZ - CLOUD AUTO COLLECT")
@@ -307,16 +348,23 @@ def main():
         if old.exists():
             old.unlink()
 
-        token = cfg["GOSZAKUP_TOKEN"]
-        run_script(
-            "goszakup",
-            "collector_goszakup.py",
-            {
-                "GOSZAKUP_TOKEN": token,
-                "TOKEN": token,
-                "API_TOKEN": token,
-            },
-        )
+        # С осени 2026 старый вход ows.goszakup.gov.kz отваливается (403, обрывы).
+        # Основной источник — открытый API Единой платформы zakup.gov.kz (без токена).
+        # Старый сборщик остаётся запасным, если новая платформа не ответила.
+        try:
+            collect_goszakup_via_zakup()
+        except Exception as zakup_error:
+            print("WARNING zakup.gov.kz failed, fallback to ows:", repr(zakup_error))
+            token = cfg["GOSZAKUP_TOKEN"]
+            run_script(
+                "goszakup",
+                "collector_goszakup.py",
+                {
+                    "GOSZAKUP_TOKEN": token,
+                    "TOKEN": token,
+                    "API_TOKEN": token,
+                },
+            )
 
         rows = make_goszakup()
         print("Prepared for Supabase:", len(rows))
