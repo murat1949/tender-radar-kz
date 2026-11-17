@@ -1,0 +1,31 @@
+name: Goszakup via zakup.gov.kz - dry run (read only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - name: Collect only, no Supabase writes
+        run: |
+          python -u - <<'PY'
+          import json
+          import auto_collect_and_sync as a
+          a.collect_goszakup_via_zakup()
+          rows = a.make_goszakup()
+          active = [r for r in rows if r["is_active"]]
+          print("ROWS", len(rows), "ACTIVE", len(active))
+          for r in sorted(active, key=lambda r: r["expires_at"] or "")[:15]:
+              print("LOT", json.dumps({k: r[k] for k in ("source_lot_id", "title", "amount", "expires_at", "status_name", "region")}, ensure_ascii=False))
+          PY
