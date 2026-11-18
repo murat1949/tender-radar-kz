@@ -123,14 +123,15 @@ def to_record(lot: Dict[str, Any], keyword: str) -> Dict[str, Any]:
     }
 
 
-def collect_keyword(keyword: str, limit: int = 600) -> List[Dict[str, Any]]:
-    """Открытые лоты по слову: активные статусы, срок подачи ещё не прошёл."""
+def collect_keyword(keyword: str, limit: int = 600, system_id: int = 1) -> List[Dict[str, Any]]:
+    """Открытые лоты по слову: активные статусы, срок подачи ещё не прошёл.
+    system_id: 1 — Госзакуп (ЭГЗ), 3 — Самрук-Казына (SKK)."""
     now = datetime.now(timezone.utc)
     found: Dict[str, Dict[str, Any]] = {}
     for status_id in ACTIVE_STATUS_IDS:
         offset = 0
         while offset < limit:
-            page = _get({"q": keyword, "status_id": status_id,
+            page = _get({"q": keyword, "status_id": status_id, "system_id": system_id,
                          "limit": PAGE_SIZE, "offset": offset})
             results = page.get("results") or []
             for lot in results:
@@ -165,7 +166,7 @@ def text_of(rec: Dict[str, Any]) -> str:
 
 
 def crawl_recent(keywords: List[str], hours: float = 8, max_pages: int = 150,
-                 budget_seconds: float = 600) -> List[Dict[str, Any]]:
+                 budget_seconds: float = 600, system_id: int = 1) -> List[Dict[str, Any]]:
     """Пролистать все свежие лоты (новые первыми) и оставить открытые,
     где встречается любое слово профиля — в названии лота, объявления или описании."""
     now = datetime.now(timezone.utc)
@@ -176,7 +177,7 @@ def crawl_recent(keywords: List[str], hours: float = 8, max_pages: int = 150,
     for page_no in range(max_pages):
         if time.monotonic() - started > budget_seconds:
             break
-        page = _get({"limit": PAGE_SIZE, "offset": page_no * PAGE_SIZE})
+        page = _get({"limit": PAGE_SIZE, "offset": page_no * PAGE_SIZE, "system_id": system_id})
         results = page.get("results") or []
         oldest = None
         for lot in results:
@@ -197,3 +198,60 @@ def crawl_recent(keywords: List[str], hours: float = 8, max_pages: int = 150,
         if len(results) < PAGE_SIZE or (oldest is not None and oldest < border):
             break
     return list(found.values())
+
+
+# ---------------- Самрук-Казына (system_id = 3) ----------------
+SAMRUK_SYSTEM_ID = 3
+SAMRUK_LOT_URL = "https://zakup.sk.kz/#/ext(popup:item/{lot_id}/lot)?tabs=lot"
+
+
+def samruk_row(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Запись zakup.gov.kz (system 3) -> строка commercial.tenders с source_code=samruk.
+    external_id совпадает с номером лота на zakup.sk.kz, поэтому дублей со старым сборщиком нет."""
+    lot_id = str(rec["external_id"])
+    return {
+        "source_code": "samruk",
+        "source_tender_id": rec.get("announcement_number") or None,
+        "source_lot_id": lot_id,
+        "public_url": SAMRUK_LOT_URL.format(lot_id=lot_id),
+        "title": rec.get("title") or "",
+        "description": rec.get("description") or "",
+        "customer_name": rec.get("customer_name") or "",
+        "customer_bin": rec.get("customer_bin") or None,
+        "region": rec.get("region") or None,
+        "procurement_method": rec.get("trade_method") or None,
+        "status_name": "Опубликовано",
+        "amount": rec.get("amount_kzt"),
+        "currency": "KZT",
+        "quantity": rec.get("quantity"),
+        "unit": None,
+        "category": None,
+        "published_at": rec.get("publish_date") or None,
+        "started_at": rec.get("start_date") or None,
+        "expires_at": rec.get("end_date") or None,
+        "is_active": True,
+        "raw": {"via": "zakup.gov.kz", "system_id": SAMRUK_SYSTEM_ID,
+                "zakup_lot_id": rec.get("zakup_lot_id"), "status": rec.get("status"),
+                "detail_checked": True, "acceptance_deadline_checked": bool(rec.get("end_date")),
+                "keyword": rec.get("keyword")},
+    }
+
+
+def collect_samruk(keywords: List[str], hours: float = 8) -> List[Dict[str, Any]]:
+    """Открытые лоты Самрука по словам профилей: поиск по названию + свежие за последние часы."""
+    found: Dict[str, Dict[str, Any]] = {}
+    failed = 0
+    for kw in keywords:
+        try:
+            for rec in collect_keyword(kw, system_id=SAMRUK_SYSTEM_ID):
+                found.setdefault(rec["external_id"], rec)
+        except Exception:
+            failed += 1
+    if keywords and failed == len(keywords):
+        raise ZakupUnavailable("zakup.gov.kz (Samruk) did not answer for any keyword")
+    try:
+        for rec in crawl_recent(keywords, hours=hours, system_id=SAMRUK_SYSTEM_ID):
+            found.setdefault(rec["external_id"], rec)
+    except Exception:
+        pass
+    return [samruk_row(r) for r in found.values()]

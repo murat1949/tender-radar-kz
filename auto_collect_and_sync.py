@@ -392,6 +392,12 @@ def update_source(cfg, source, ok=True, err=None):
         print("WARNING: source status update failed:", source, repr(e))
 
 
+SAMRUK_KEYWORDS = [
+    "картридж",
+    "тонер",
+    "расходные материалы для оргтехники",
+]
+
 GOSZAKUP_KEYWORDS = [
     "картридж",
     "тонер",
@@ -451,16 +457,25 @@ def main():
         if old.exists():
             old.unlink()
 
-        run_script(
-            "samruk",
-            "samruk_collector.py",
-            {
-                # В основном облачном цикле подробно открываем только несколько
-                # лотов, чтобы обновление не растягивалось на десятки минут.
-                # Все найденные лоты всё равно сохраняются из списка Samruk.
-                "SAMRUK_DETAIL_LIMIT": os.getenv("SAMRUK_DETAIL_LIMIT", "0"),
-            },
-        )
+        # С 17.11.2026 сайт zakup.sk.kz не пускает зарубежные серверы. Лоты Самрука
+        # берём с открытого API zakup.gov.kz (система SKK, номера лотов те же).
+        # Браузерный сборщик по сайту Самрука остаётся запасным.
+        try:
+            import collector_zakup
+            sk_rows = collector_zakup.collect_samruk(SAMRUK_KEYWORDS)
+            OUT.mkdir(parents=True, exist_ok=True)
+            (OUT / "samruk_tenders.json").write_text(
+                json.dumps(sk_rows, ensure_ascii=False, indent=2), encoding="utf-8")
+            print("[zakup] samruk open lots:", len(sk_rows))
+        except Exception as zakup_error:
+            print("WARNING samruk via zakup.gov.kz failed, fallback to browser:", repr(zakup_error))
+            run_script(
+                "samruk",
+                "samruk_collector.py",
+                {
+                    "SAMRUK_DETAIL_LIMIT": os.getenv("SAMRUK_DETAIL_LIMIT", "0"),
+                },
+            )
         rows = make_samruk()
         validate_samruk_lots(rows)
 
